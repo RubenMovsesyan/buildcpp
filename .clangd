@@ -1,29 +1,32 @@
 CompileFlags:
-  Add:
-    - -std=c++23
-    - -stdlib=libc++
-  Remove:
-    - -march=native
-    - --cuda-gpu-arch=*
-    - -forward-unknown-to-host-compiler
-    - --use_fast_math
-    - --options-file
-    - --extend-lambda
-    - --expt-relaxed-constexpr
-    - -gencode=*
-    - --generate-code=*
-    - -Xcompiler=*
-    - -x
-    - cu
+    Add:
+        - -xc
+        - -std=c23
+        - -stdlib=libc
+    Remove:
+        - -stdlib=*
+        - -std=c++*
+        - -march=native
+        - --cuda-gpu-arch=*
+        - -forward-unknown-to-host-compiler
+        - --use_fast_math
+        - --options-file
+        - --extend-lambda
+        - --expt-relaxed-constexpr
+        - -gencode=*
+        - --generate-code=*
+        - -Xcompiler=*
+        - -x
+        - cu
 
 Index:
-  Background: Skip
+    Background: Skip
 
 Diagnostics:
-  UnusedIncludes: None
+    UnusedIncludes: None
 If:
-  PathMatch: external/.*
-  Index:
-    Background: Skip
-  Diagnostics:
-    Suppress: '*'
+    PathMatch: external/.*
+    Index:
+        Background: Skip
+    Diagnostics:
+        Suppress: "*"

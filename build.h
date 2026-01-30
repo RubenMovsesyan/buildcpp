@@ -7,21 +7,23 @@
 #endif
 #endif
 
+#include <limits.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
-#ifdef __APPLE__
-#include <sys/_pthread/_pthread_mutex_t.h>
-#include <sys/syslimits.h>
-#else
-#include <limits.h>
-#include <pthread.h>
-#endif
+// #ifdef __APPLE__
+// #include <sys/_pthread/_pthread_mutex_t.h>
+// #include <sys/syslimits.h>
+// #else
+// #endif
 
 #define Vector(type)    \
     struct {            \
@@ -61,6 +63,8 @@ typedef struct {
         char* dep_name;
         char** deps;
 } DependencyList;
+
+void freeDependencyList(DependencyList* dep_list);
 
 // --== (Command Interface) ==--
 
@@ -141,14 +145,14 @@ typedef struct {
 Object* newObject(const char* path);
 void freeObject(Object* obj);
 char* allocObjectPath(Object* obj);
-DependencyList objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes);
+DependencyList* objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes);
 char** allocBuildCommand(Object* obj, char* build_dir);
 void compile(
     Object* obj,
-    const char* compiler,
-    const char* flags,
-    const char* includes,
-    const char* build_dir,
+    char* compiler,
+    char* flags,
+    char* includes,
+    char* build_dir,
     StrVec* obj_files,
     pthread_mutex_t* obj_files_mutex,
     CompCmdVec* compile_commands,
@@ -271,6 +275,18 @@ void buildStep(Build* build);
 void buildBuild(Build* build);
 
 // #ifdef BUILD_IMPLEMENTATION
+
+// --== Dependency List Implementation ==--
+
+void freeDependencyList(DependencyList* dep_list) {
+    free(dep_list->dep_name);
+
+    for (int i = 0; dep_list->deps[i]; i++) {
+        free(dep_list->deps[i]);
+    }
+
+    free(dep_list);
+}
 
 // --== Command Implementation ==--
 
@@ -532,7 +548,7 @@ char* extractFilename(char* absolute_path) {
         index--;
     }
 
-    return strdup(absolute_path - index);
+    return strdup(absolute_path + index + 1);
 }
 
 char* removeFilenameExtension(char* filename) {
@@ -568,26 +584,219 @@ char* allocObjectPath(Object* obj) {
     return strdup(obj->src_path);
 }
 
-DependencyList objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes) {
-    Command* dep_cmd = newCommand(5, compiler, flags, includes, "-MM", obj->src_path);
-    char* output = allocCmdExecAndCapture(dep_cmd);
+char** splitWhitespace(const char* str, size_t* out_count) {
+    size_t cap = 8;
+    size_t len = 0;
+    char** result = (char**)malloc(cap * sizeof(char*));
 
-    freeCommand(dep_cmd);
-    free(output);
+    const char* p = str;
+    while (*p) {
+        while (*p && (*p == ' ' || *p == '\t'))
+            p++;
+        if (!*p)
+            break;
+
+        const char* start = p;
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+
+        size_t word_len = p - start;
+        if (word_len > 0) {
+            if (len == cap) {
+                cap *= 2;
+                result = (char**)realloc(result, cap * sizeof(char*));
+            }
+            result[len] = (char*)malloc(word_len + 1);
+            memcpy(result[len], start, word_len);
+            result[len][word_len] = '\0';
+            len++;
+        }
+    }
+
+    *out_count = len;
+    return result;
 }
 
-char** allocBuildCommand(Object* obj, char* build_dir);
+DependencyList* objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes) {
+    Command* dep_cmd = newCommand(5, compiler, flags, includes, "-MM", obj->src_path);
+    char* output = allocCmdExecAndCapture(dep_cmd);
+    freeCommand(dep_cmd);
+
+    if (!output) {
+        return (DependencyList*)calloc(1, sizeof(DependencyList));
+    }
+
+    char* dst = output;
+    for (char* src = output; *src; src++) {
+        if (*src != '\\' && *src != '\n') {
+            *dst++ = *src;
+        }
+    }
+    *dst = '\0';
+
+    char* colon = strchr(output, ':');
+    if (!colon) {
+        free(output);
+        return (DependencyList*)calloc(1, sizeof(DependencyList));
+    }
+
+    // Extract object file name (before colon)
+    *colon = '\0';
+    char* dep_name = strdup(output);
+
+    size_t dep_count;
+    char** deps = splitWhitespace(colon + 1, &dep_count);
+
+    // Null terminate the array
+    deps = (char**)realloc(deps, (dep_count + 1) * sizeof(char*));
+    deps[dep_count] = nullptr;
+
+    free(output);
+
+    DependencyList* dep_output = (DependencyList*)calloc(1, sizeof(DependencyList));
+    dep_output->dep_name = dep_name;
+    dep_output->deps = deps;
+
+    return dep_output;
+}
+
+char* replaceFileExt(char* path, const char* new_ext) {
+    size_t len = strlen(path);
+    size_t orig_len = len;
+    while (path[len] != '.') {
+        len--;
+    }
+
+    size_t ext_len = strlen(new_ext);
+
+    if (len + ext_len + 1 > orig_len) {
+        path = (char*)realloc(path, len + ext_len + 2);
+    }
+
+    // Make sure to copy over the null terminator
+    memcpy(path + len + 1, new_ext, ext_len);
+    path[len + 1 + ext_len] = '\0';
+    return path;
+}
+
+char* removeFilename(char* path) {
+    char* filename_removed = strdup(path);
+    size_t index = strlen(filename_removed);
+    while (filename_removed[index] != '/') {
+        index--;
+    }
+
+    filename_removed[index] = '\0';
+    return filename_removed;
+}
+
+char** allocBuildCommand(Object* obj, char* build_dir) {
+    // Find the relative path to the source file
+    char* relative_path = nullptr;
+    char cwd[PATH_MAX];
+    getcwd(cwd, PATH_MAX);
+    size_t offset = 0;
+    while (cwd[offset] == obj->src_path[offset]) {
+        offset++;
+    }
+    relative_path = obj->src_path + offset + 1;
+
+    char* expanded_build_dir = expandPath(build_dir);
+
+    char* new_path = strcat(expanded_build_dir, "/");
+    new_path = strcat(new_path, relative_path);
+    char* filename_removed = removeFilename(new_path);
+
+    Command* make_path = newCommand(3, "mkdir", "-p", filename_removed);
+    cmdExec(make_path);
+    free(filename_removed);
+
+    new_path = replaceFileExt(new_path, "o");
+
+    char** output = (char**)calloc(4, sizeof(char*));
+
+    // Duplicate for simpler freeing later
+    output[0] = strdup("-c");
+    output[1] = strdup(relative_path);
+    output[2] = strdup("-o");
+    output[3] = new_path;
+
+    return output;
+}
+
 void compile(
     Object* obj,
-    const char* compiler,
-    const char* flags,
-    const char* includes,
-    const char* build_dir,
+    char* compiler,
+    char* flags,
+    char* includes,
+    char* build_dir,
     StrVec* obj_files,
     pthread_mutex_t* obj_files_mutex,
     CompCmdVec* compile_commands,
     pthread_mutex_t* comp_cmd_mutex
-);
+) {
+    DependencyList* deps_list = objectListDependencies(
+        obj,
+        compiler,
+        flags,
+        includes
+    );
+
+    Command* cmd = newCommand(3, compiler, flags, includes);
+    char** build_commands = allocBuildCommand(obj, build_dir);
+
+    for (int i = 0; i < 4; i++) {
+        cmdPushBack(cmd, build_commands[i]);
+    }
+
+    char* obj_path = allocObjectPath(obj);
+    CompileCommand comp_cmd = newCompileCommand(cmd, obj_path);
+    free(obj_path);
+
+    pthread_mutex_lock(comp_cmd_mutex);
+    VectorPushBack(CompileCommand, compile_commands, comp_cmd);
+    pthread_mutex_unlock(comp_cmd_mutex);
+
+    bool needs_rebuild = true;
+    struct stat attr;
+    if (stat(obj->src_path, &attr) == 0) {
+        time_t object_time = attr.st_mtime;
+        needs_rebuild = false;
+
+        struct stat dep_attr;
+        for (int i = 0; deps_list->deps[i]; i++) {
+            if (stat(deps_list->deps[i], &dep_attr) == 0) {
+                // Add 1 second incase the file was just written to
+                time_t dep_time = dep_attr.st_mtime + 1;
+                if (dep_time > object_time) {
+                    needs_rebuild = true;
+                    break;
+                }
+            } else {
+                needs_rebuild = true;
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_lock(obj_files_mutex);
+    VectorPushBack(char*, obj_files, build_commands[3]);
+    pthread_mutex_unlock(obj_files_mutex);
+
+    if (!needs_rebuild) {
+        return;
+    }
+
+    cmdPrint(cmd);
+    int ret_code = cmdExec(cmd);
+    freeCommand(cmd);
+    freeDependencyList(deps_list);
+
+    if (ret_code != 0) {
+        printf("Object file build failed\n");
+        exit(1);
+    }
+}
 
 // #endif // BUILD_IMPLEMENTATION
 #endif // BUILD_H

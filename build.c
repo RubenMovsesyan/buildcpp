@@ -2,16 +2,15 @@
 #include "build.h"
 
 int main(int argc, char** argv) {
-    Include* inc = newDirectInclude(".");
-    Include* sym_inc = newSymbolicInclude(".", "buildcpp");
+    Object* obj = newObject("main_test.c");
 
-    char* inc_str = allocIncludePath(inc, "syms");
-    char* sym_inc_ptr = allocIncludePath(sym_inc, "syms");
+    StrVec obj_files = {0};
+    CompCmdVec cmp_cmd = {0};
+    pthread_mutex_t obj_file_mut = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t comp_file_mut = PTHREAD_MUTEX_INITIALIZER;
 
-    free(inc_str);
-    free(sym_inc_ptr);
+    compile(obj, "clang", "-std=c23", "", ".build", &obj_files, &obj_file_mut, &cmp_cmd, &comp_file_mut);
 
-    freeInclude(inc);
-    freeInclude(sym_inc);
+    freeObject(obj);
     return 0;
 }
