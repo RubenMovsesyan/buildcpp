@@ -266,8 +266,7 @@ void buildAddLinkingFlag(Build* build, const char* flag);
 void buildStep(Build* build);
 void buildBuild(Build* build);
 
-#ifdef BUILD_IMPLMENTATION
-#endif // BUILD_IMPLEMENTATION
+#ifdef BUILD_IMPLEMENTATION
 
 char* expandPath(const char* path) {
     char* expanded = (char*)malloc(PATH_MAX);
@@ -427,4 +426,5 @@ char* allocExecAndCapture(Command* cmd) {
     return result;
 }
 
+#endif // BUILD_IMPLEMENTATION
 #endif // BUILD_H
