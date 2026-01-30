@@ -2,17 +2,16 @@
 #include "build.h"
 
 int main(int argc, char** argv) {
-    Command* cmd = newCommand(2, "cat", "build.c");
+    Include* inc = newDirectInclude(".");
+    Include* sym_inc = newSymbolicInclude(".", "buildcpp");
 
-    char* cmd_str = allocString(cmd);
-    printf("Cmd Str: %s", cmd_str);
+    char* inc_str = allocIncludePath(inc, "syms");
+    char* sym_inc_ptr = allocIncludePath(sym_inc, "syms");
 
-    char* captured = allocExecAndCapture(cmd);
+    free(inc_str);
+    free(sym_inc_ptr);
 
-    printf("Captured\n%s", captured);
-
-    freeCommand(cmd);
-    free(cmd_str);
-    free(captured);
+    freeInclude(inc);
+    freeInclude(sym_inc);
     return 0;
 }

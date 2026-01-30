@@ -79,8 +79,8 @@ void cmdPrint(Command* cmd);
 
 char* allocString(Command* cmd);
 
-int exec(Command* cmd);
-char* allocExecAndCapture(Command* cmd);
+int cmdExec(Command* cmd);
+char* allocCmdExecAndCapture(Command* cmd);
 
 typedef Vector(Command) CmdVec;
 
@@ -92,7 +92,8 @@ typedef struct {
         char* file;
 } CompileCommand;
 
-CompileCommand newCompileCommand(Command* src_cmd, char* file);
+CompileCommand newCompileCommand(Command* src_cmd, char* filepath);
+void freeCompileCommand(CompileCommand* comp_cmd);
 void compCmdAddToFile(CompileCommand* comp_cmd, FILE* file);
 
 typedef Vector(CompileCommand) CompCmdVec;
@@ -109,8 +110,8 @@ typedef struct {
 } SymbolicInclude;
 
 typedef enum {
-    IncludeDirect,
-    IncludeSymbolic
+    Include_Direct,
+    Include_Symbolic
 } IncludeType;
 
 typedef struct {
@@ -123,6 +124,8 @@ typedef struct {
 
 Include* newDirectInclude(const char* path);
 Include* newSymbolicInclude(const char* path, const char* symbolic_dir);
+void freeInclude(Include* include);
+
 char* allocIncludePath(Include* inc, const char* symlinks_path);
 
 typedef Vector(Include) IncludeVec;
@@ -136,6 +139,7 @@ typedef struct {
 } Object;
 
 Object* newObject(const char* path);
+void freeObject(Object* obj);
 char* allocObjectPath(Object* obj);
 DependencyList objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes);
 char** allocBuildCommand(Object* obj, char* build_dir);
@@ -171,9 +175,9 @@ typedef struct {
 } Framework;
 
 typedef enum {
-    LinkDirect,
-    LinkPath,
-    LinkFramework
+    Link_Direct,
+    Link_Path,
+    Link_Framework
 } LinkType;
 
 typedef struct {
@@ -195,15 +199,15 @@ typedef Vector(Link) LinkVec;
 
 // --== (Build Interface) ==--
 typedef enum {
-    OsInvalid,
-    OsMacOS,
-    OsLinux,
-    OsWindows
+    Os_Invalid,
+    Os_MacOS,
+    Os_Linux,
+    Os_Windows
 } Os;
 
 typedef enum {
-    ModeRelease,
-    ModeDebug
+    Mode_Release,
+    Mode_Debug
 } Mode;
 
 typedef struct {
@@ -266,7 +270,9 @@ void buildAddLinkingFlag(Build* build, const char* flag);
 void buildStep(Build* build);
 void buildBuild(Build* build);
 
-#ifdef BUILD_IMPLEMENTATION
+// #ifdef BUILD_IMPLEMENTATION
+
+// --== Command Implementation ==--
 
 char* expandPath(const char* path) {
     char* expanded = (char*)malloc(PATH_MAX);
@@ -334,6 +340,8 @@ void freeCommand(Command* cmd) {
     if (cmd->exec_dir) {
         free(cmd->exec_dir);
     }
+
+    free(cmd);
 }
 
 void cmdPushBack(Command* cmd, char* chain) {
@@ -363,7 +371,7 @@ char* allocString(Command* cmd) {
     return str.ptr;
 }
 
-int exec(Command* cmd) {
+int cmdExec(Command* cmd) {
     char cwd[PATH_MAX];
     getcwd(cwd, sizeof(cwd));
 
@@ -383,7 +391,7 @@ int exec(Command* cmd) {
     return result;
 }
 
-char* allocExecAndCapture(Command* cmd) {
+char* allocCmdExecAndCapture(Command* cmd) {
     char cwd[PATH_MAX];
     getcwd(cwd, sizeof(cwd));
 
@@ -426,5 +434,160 @@ char* allocExecAndCapture(Command* cmd) {
     return result;
 }
 
-#endif // BUILD_IMPLEMENTATION
+// --== Compile Command Implementation ==--
+
+CompileCommand newCompileCommand(Command* src_cmd, char* filepath) {
+    CompileCommand comp_cmd = {0};
+
+    comp_cmd.src_cmd = src_cmd;
+    char cwd[PATH_MAX];
+    getcwd(cwd, sizeof(cwd));
+    comp_cmd.dir = strdup(cwd);
+    comp_cmd.file = expandPath(filepath);
+
+    return comp_cmd;
+}
+
+void freeCompileCommand(CompileCommand* comp_cmd) {
+    free(comp_cmd->dir);
+}
+
+void compCmdAddToFile(CompileCommand* comp_cmd, FILE* file) {
+    char* command_str = allocString(comp_cmd->src_cmd);
+
+    fprintf(file, "\t{\n");
+
+    fprintf(file, "\t\t\"directory\": \"%s\",\n", comp_cmd->dir);
+    fprintf(file, "\t\t\"command\": \"%s\",\n", command_str);
+    fprintf(file, "\t\t\"file\": \"%s\"\n", comp_cmd->file);
+
+    fprintf(file, "\t}\n");
+
+    free(command_str);
+}
+
+// --== Include Implementation ==--
+Include* newDirectInclude(const char* path) {
+    Include* inc = (Include*)calloc(1, sizeof(Include));
+
+    inc->type = Include_Direct;
+    inc->include.direct = (DirectInclude){
+        .include_path = expandPath(path)
+    };
+
+    return inc;
+}
+
+Include* newSymbolicInclude(const char* path, const char* symbolic_dir) {
+    Include* inc = (Include*)calloc(1, sizeof(Include));
+
+    inc->type = Include_Symbolic;
+    inc->include.symbolic = (SymbolicInclude){
+        .include_path = expandPath(path),
+        .symbolic_dir = strdup(symbolic_dir),
+    };
+
+    return inc;
+}
+
+void freeInclude(Include* include) {
+    switch (include->type) {
+        case Include_Direct:
+            free(include->include.direct.include_path);
+            break;
+        case Include_Symbolic:
+            free(include->include.symbolic.include_path);
+            free(include->include.symbolic.symbolic_dir);
+            break;
+    }
+
+    free(include);
+}
+
+char* allocIncludePath(Include* inc, const char* symlinks_path) {
+    switch (inc->type) {
+        case Include_Direct:
+            return strdup(inc->include.direct.include_path);
+        case Include_Symbolic:
+            char* symlink_path_expanded = expandPath(symlinks_path);
+            char sym_path[PATH_MAX];
+            sprintf(sym_path, "%s/%s", symlink_path_expanded, inc->include.symbolic.symbolic_dir);
+            free(symlink_path_expanded);
+            Command* create_symbolic_dir = newCommand(4, "ln", "-sfn", inc->include.symbolic.include_path, sym_path);
+
+            cmdPrint(create_symbolic_dir);
+            cmdExec(create_symbolic_dir);
+
+            freeCommand(create_symbolic_dir);
+
+            return strdup(sym_path);
+    }
+}
+
+// --== Object Implementation ==--
+
+char* extractFilename(char* absolute_path) {
+    size_t index = strlen(absolute_path) - 1;
+    while (absolute_path[index] != '/') {
+        index--;
+    }
+
+    return strdup(absolute_path - index);
+}
+
+char* removeFilenameExtension(char* filename) {
+    size_t index = strlen(filename) - 1;
+    while (filename[index] != '.') {
+        index--;
+    }
+
+    char* extended = strdup(filename);
+    extended[index] = '\0';
+
+    return extended;
+}
+
+Object* newObject(const char* path) {
+    Object* obj = (Object*)calloc(1, sizeof(Object));
+
+    obj->src_path = expandPath(path);
+    obj->filename = extractFilename(obj->src_path);
+    obj->filename_no_ext = removeFilenameExtension(obj->filename);
+
+    return obj;
+}
+
+void freeObject(Object* obj) {
+    free(obj->src_path);
+    free(obj->filename);
+    free(obj->filename_no_ext);
+    free(obj);
+}
+
+char* allocObjectPath(Object* obj) {
+    return strdup(obj->src_path);
+}
+
+DependencyList objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes) {
+    Command* dep_cmd = newCommand(5, compiler, flags, includes, "-MM", obj->src_path);
+    char* output = allocCmdExecAndCapture(dep_cmd);
+
+    freeCommand(dep_cmd);
+    free(output);
+}
+
+char** allocBuildCommand(Object* obj, char* build_dir);
+void compile(
+    Object* obj,
+    const char* compiler,
+    const char* flags,
+    const char* includes,
+    const char* build_dir,
+    StrVec* obj_files,
+    pthread_mutex_t* obj_files_mutex,
+    CompCmdVec* compile_commands,
+    pthread_mutex_t* comp_cmd_mutex
+);
+
+// #endif // BUILD_IMPLEMENTATION
 #endif // BUILD_H
