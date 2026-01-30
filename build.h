@@ -1,15 +1,23 @@
 #ifndef BUILD_H
 #define BUILD_H
 
+#define _GNU_SOURCE
+
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#ifdef __APPLE__
 #include <sys/_pthread/_pthread_mutex_t.h>
 #include <sys/syslimits.h>
-#include <unistd.h>
+#else
+#include <limits.h>
+#include <pthread.h>
+#endif
 
 #define Vector(type)    \
     struct {            \
