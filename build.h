@@ -1,7 +1,11 @@
 #ifndef BUILD_H
 #define BUILD_H
 
+#ifdef __linux__
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#endif
 
 #include <stdarg.h>
 #include <stdatomic.h>
