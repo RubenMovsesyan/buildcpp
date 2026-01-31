@@ -272,7 +272,7 @@ class Object {
 
                 for (const auto& dep_path : deps_paths) {
                     if (std::filesystem::exists(dep_path)) {
-		    	// Add a second buffer in case the file was saved right away
+                        // Add a second buffer in case the file was saved right away
                         auto dep_time = std::filesystem::last_write_time(dep_path) + std::chrono::seconds(1);
                         if (dep_time > object_time) {
                             needs_rebuild = true;
@@ -500,7 +500,11 @@ class Build {
         void rebuildYourself(int argc, char** argv) {
             std::filesystem::path build_cpp = "build.cpp";
             std::filesystem::path build_hpp = "build.hpp";
+#ifdef __WIN32
+            std::filesystem::path build_exe = "build.exe";
+#else
             std::filesystem::path build_exe = "build";
+#endif
 
             if (!std::filesystem::exists(build_cpp) || !std::filesystem::exists(build_hpp)) {
                 std::println("Error: build.cpp or build.hpp not found");

@@ -1,0 +1,20 @@
+[
+	{
+		"directory": "/Users/rmovs/dev/buildcpp",
+		"command": "clang  -I /Users/rmovs/dev/buildcpp/test_src  -c test_src/incs/foo.c -o /Users/rmovs/dev/buildcpp/.build/test_src/incs/foo.o ",
+		"file": "/Users/rmovs/dev/buildcpp/test_src/incs/foo.c"
+	}
+,
+	{
+		"directory": "/Users/rmovs/dev/buildcpp",
+		"command": "clang  -I /Users/rmovs/dev/buildcpp/test_src  -c test_src/incs/bar.c -o /Users/rmovs/dev/buildcpp/.build/test_src/incs/bar.o ",
+		"file": "/Users/rmovs/dev/buildcpp/test_src/incs/bar.c"
+	}
+,
+	{
+		"directory": "/Users/rmovs/dev/buildcpp",
+		"command": "clang  -I /Users/rmovs/dev/buildcpp/test_src  -c test_src/main.c -o /Users/rmovs/dev/buildcpp/.build/test_src/main.o ",
+		"file": "/Users/rmovs/dev/buildcpp/test_src/main.c"
+	}
+,
+]

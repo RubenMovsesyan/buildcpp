@@ -1,16 +1,20 @@
 #define BUILD_IMPLEMENTATION
 #include "build.h"
 
+const char* BUILD_DIR = ".build";
+
 int main(int argc, char** argv) {
-    Object* obj = newObject("main_test.c");
+    Build* build = newBuildWithCompiler(BUILD_DIR, "clang", argc, argv);
+    rebuildYourself(build);
 
-    StrVec obj_files = {0};
-    CompCmdVec cmp_cmd = {0};
-    pthread_mutex_t obj_file_mut = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_t comp_file_mut = PTHREAD_MUTEX_INITIALIZER;
+    buildAddInclude(build, newDirectInclude("test_src"));
 
-    compile(obj, "clang", "-std=c23", "", ".build", &obj_files, &obj_file_mut, &cmp_cmd, &comp_file_mut);
+    buildAddObject(build, newObject("test_src/incs/foo.c"));
+    buildAddObject(build, newObject("test_src/incs/bar.c"));
+    buildAddObject(build, newObject("test_src/main.c"));
 
-    freeObject(obj);
+    buildBuild(build);
+    freeBuild(build);
+
     return 0;
 }

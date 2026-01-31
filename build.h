@@ -7,6 +7,7 @@
 #endif
 #endif
 
+#include <errno.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -19,11 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
-// #ifdef __APPLE__
-// #include <sys/_pthread/_pthread_mutex_t.h>
-// #include <sys/syslimits.h>
-// #else
-// #endif
+const char* DEFAULT_COMPILER = "clang";
 
 #define Vector(type)    \
     struct {            \
@@ -48,14 +45,6 @@
 
 #define VectorFree(vector) \
     free((vector)->ptr);
-
-#define RingedQueue(type) \
-    struct {              \
-            type* start;  \
-            type* end;    \
-            size_t cap;   \
-            size_t len;   \
-    }
 
 typedef Vector(char*) StrVec;
 
@@ -91,7 +80,7 @@ typedef Vector(Command) CmdVec;
 // --== (Compile Command Interface) ==--
 
 typedef struct {
-        Command* src_cmd;
+        char* src_cmd;
         char* dir;
         char* file;
 } CompileCommand;
@@ -129,6 +118,7 @@ typedef struct {
 Include* newDirectInclude(const char* path);
 Include* newSymbolicInclude(const char* path, const char* symbolic_dir);
 void freeInclude(Include* include);
+void destroyInclude(Include* include);
 
 char* allocIncludePath(Include* inc, const char* symlinks_path);
 
@@ -144,6 +134,7 @@ typedef struct {
 
 Object* newObject(const char* path);
 void freeObject(Object* obj);
+void destroyObject(Object* obj);
 char* allocObjectPath(Object* obj);
 DependencyList* objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes);
 char** allocBuildCommand(Object* obj, char* build_dir);
@@ -160,7 +151,20 @@ void compile(
 );
 
 typedef Vector(Object) ObjVec;
-typedef RingedQueue(Object) ObjRingQueue;
+
+// --== (Object Queue Interface) ==--
+
+typedef struct {
+        Object** objects;
+        Object** start;
+        Object** end;
+        size_t cap;
+} ObjectQueue;
+
+ObjectQueue* newObjectQueue(size_t cap);
+void objQPush(ObjectQueue* q, Object* obj);
+Object* objQPop(ObjectQueue* q);
+void freeObjQueue(ObjectQueue* q);
 
 // --== (Link Interface) ==--
 typedef struct {
@@ -194,9 +198,10 @@ typedef struct {
 } Link;
 
 Link* newDirectLink(const char* dep_name);
-Link* newPathLink(const char* dir_name);
+Link* newPathLink(const char* path);
 Link* newPathLinkWithDep(const char* dep_name, const char* dir_name);
 Link* newFramework(const char* dep_name);
+void freeLink(Link* link);
 char* allocLinkable(Link* link);
 
 typedef Vector(Link) LinkVec;
@@ -236,7 +241,7 @@ typedef struct {
         atomic_bool all_jobs_queued;
         atomic_bool all_jobs_complete;
 
-        ObjRingQueue objects;
+        ObjectQueue* objects;
 } BuildJob;
 
 typedef Vector(BuildJob) BuildJobVec;
@@ -254,13 +259,16 @@ typedef struct {
         size_t jobs_;
 
         bool skip_compile_commands;
+
+        int argc;
+        char** argv;
 } Build;
 
 void initCommon(Build* build);
 
-Build newBuild(const char* dir_name, int argc, char** argv);
-Build newBuildWithCompiler(const char* dir_name, const char* compiler, int argc, char** argv);
-void destroyBuild(Build* build);
+Build* newBuild(const char* dir_name, int argc, char** argv);
+Build* newBuildWithCompiler(const char* dir_name, char* compiler, int argc, char** argv);
+void freeBuild(Build* build);
 
 void rebuildYourself(Build* build);
 void buildExportCompileCommands(Build* build, CompCmdVec* compile_commands);
@@ -269,8 +277,8 @@ void buildAddPrebuildCommand(Build* build, Command* command);
 void buildAddObject(Build* build, Object* object);
 void buildAddInclude(Build* build, Include* include);
 void buildAddLink(Build* build, Link* link);
-void buildAddCompilationFlag(Build* build, const char* flag);
-void buildAddLinkingFlag(Build* build, const char* flag);
+void buildAddCompilationFlag(Build* build, char* flag);
+void buildAddLinkingFlag(Build* build, char* flag);
 void buildStep(Build* build);
 void buildBuild(Build* build);
 
@@ -284,6 +292,7 @@ void freeDependencyList(DependencyList* dep_list) {
     for (int i = 0; dep_list->deps[i]; i++) {
         free(dep_list->deps[i]);
     }
+    free(dep_list->deps);
 
     free(dep_list);
 }
@@ -417,8 +426,9 @@ char* allocCmdExecAndCapture(Command* cmd) {
 
     char* command = allocString(cmd);
     int len = strlen(command);
-    command = (char*)realloc(command, len + 5);
-    strcpy(command + len, " 2>&1");
+    const char* stderr_2_out = " 2>&1";
+    command = (char*)realloc(command, len + strlen(stderr_2_out) + 1);
+    strcpy(command + len, stderr_2_out);
 
     FILE* pipe = popen(command, "r");
     if (!pipe) {
@@ -455,7 +465,7 @@ char* allocCmdExecAndCapture(Command* cmd) {
 CompileCommand newCompileCommand(Command* src_cmd, char* filepath) {
     CompileCommand comp_cmd = {0};
 
-    comp_cmd.src_cmd = src_cmd;
+    comp_cmd.src_cmd = allocString(src_cmd);
     char cwd[PATH_MAX];
     getcwd(cwd, sizeof(cwd));
     comp_cmd.dir = strdup(cwd);
@@ -466,20 +476,17 @@ CompileCommand newCompileCommand(Command* src_cmd, char* filepath) {
 
 void freeCompileCommand(CompileCommand* comp_cmd) {
     free(comp_cmd->dir);
+    free(comp_cmd->src_cmd);
 }
 
 void compCmdAddToFile(CompileCommand* comp_cmd, FILE* file) {
-    char* command_str = allocString(comp_cmd->src_cmd);
-
     fprintf(file, "\t{\n");
 
     fprintf(file, "\t\t\"directory\": \"%s\",\n", comp_cmd->dir);
-    fprintf(file, "\t\t\"command\": \"%s\",\n", command_str);
+    fprintf(file, "\t\t\"command\": \"%s\",\n", comp_cmd->src_cmd);
     fprintf(file, "\t\t\"file\": \"%s\"\n", comp_cmd->file);
 
     fprintf(file, "\t}\n");
-
-    free(command_str);
 }
 
 // --== Include Implementation ==--
@@ -518,6 +525,18 @@ void freeInclude(Include* include) {
     }
 
     free(include);
+}
+
+void destroyInclude(Include* include) {
+    switch (include->type) {
+        case Include_Direct:
+            free(include->include.direct.include_path);
+            break;
+        case Include_Symbolic:
+            free(include->include.symbolic.include_path);
+            free(include->include.symbolic.symbolic_dir);
+            break;
+    }
 }
 
 char* allocIncludePath(Include* inc, const char* symlinks_path) {
@@ -578,6 +597,12 @@ void freeObject(Object* obj) {
     free(obj->filename);
     free(obj->filename_no_ext);
     free(obj);
+}
+
+void destroyObject(Object* obj) {
+    free(obj->src_path);
+    free(obj->filename);
+    free(obj->filename_no_ext);
 }
 
 char* allocObjectPath(Object* obj) {
@@ -709,6 +734,7 @@ char** allocBuildCommand(Object* obj, char* build_dir) {
 
     Command* make_path = newCommand(3, "mkdir", "-p", filename_removed);
     cmdExec(make_path);
+    freeCommand(make_path);
     free(filename_removed);
 
     new_path = replaceFileExt(new_path, "o");
@@ -784,6 +810,12 @@ void compile(
     pthread_mutex_unlock(obj_files_mutex);
 
     if (!needs_rebuild) {
+        freeCommand(cmd);
+        freeDependencyList(deps_list);
+        for (size_t i = 0; i < 2; i++) {
+            free(build_commands[i]);
+        }
+        free(build_commands);
         return;
     }
 
@@ -795,6 +827,594 @@ void compile(
     if (ret_code != 0) {
         printf("Object file build failed\n");
         exit(1);
+    }
+}
+
+// --== ObjectQueue Implementation ==--
+
+ObjectQueue* newObjectQueue(size_t cap) {
+    ObjectQueue* q = (ObjectQueue*)calloc(1, sizeof(ObjectQueue));
+
+    q->cap = cap;
+    q->objects = (Object**)calloc(cap, sizeof(Object*));
+    q->start = q->objects;
+    q->end = q->objects;
+
+    return q;
+}
+void freeObjQueue(ObjectQueue* q) {
+    free(q->objects);
+    free(q);
+}
+
+void objQPush(ObjectQueue* q, Object* obj) {
+    Object** next_end = q->end + 1;
+    if (next_end >= q->objects + q->cap) {
+        next_end = q->objects;
+    }
+
+    if (next_end == q->start) {
+        printf("Object Queue full\n");
+        exit(1);
+    }
+
+    *q->end = obj;
+    q->end = next_end;
+}
+
+Object* objQPop(ObjectQueue* q) {
+    if (q->start == q->end) {
+        return nullptr;
+    }
+
+    Object* obj = *q->start;
+    q->start++;
+    if (q->start >= q->objects + q->cap) {
+        q->start = q->objects;
+    }
+    return obj;
+}
+
+// --== Link Implementation ==--
+Link* newDirectLink(const char* dep_name) {
+    Link* link = (Link*)calloc(1, sizeof(Link));
+
+    link->type = Link_Direct;
+    link->link.direct_link.dep_name = strdup(dep_name);
+
+    return link;
+}
+
+Link* newPathLink(const char* path) {
+    Link* link = (Link*)calloc(1, sizeof(Link));
+
+    link->type = Link_Path;
+    link->link.path_link.dir_name = nullptr;
+    link->link.path_link.direct_path = strdup(path);
+    link->link.path_link.dep_name = nullptr;
+
+    return link;
+}
+
+Link* newPathLinkWithDep(const char* dep_name, const char* dir_name) {
+    Link* link = (Link*)calloc(1, sizeof(Link));
+
+    link->type = Link_Path;
+    link->link.path_link.dir_name = expandPath(dir_name);
+    link->link.path_link.direct_path = nullptr,
+    link->link.path_link.dep_name = strdup(dep_name);
+
+    return link;
+}
+
+Link* newFramework(const char* dep_name) {
+    Link* link = (Link*)calloc(1, sizeof(Link));
+
+    link->type = Link_Framework;
+    link->link.framework.dep_name = strdup(dep_name);
+
+    return link;
+}
+
+void freeLink(Link* link) {
+    switch (link->type) {
+        case Link_Direct:
+            free(link->link.direct_link.dep_name);
+            break;
+        case Link_Path:
+            free(link->link.path_link.dir_name);
+            free(link->link.path_link.direct_path);
+            free(link->link.path_link.dep_name);
+            break;
+        case Link_Framework:
+            free(link->link.framework.dep_name);
+            break;
+    }
+
+    free(link);
+}
+
+char* allocLinkable(Link* link) {
+    switch (link->type) {
+        case Link_Direct:
+            return strcat(strdup("-l"), link->link.direct_link.dep_name);
+        case Link_Path:
+            if (link->link.path_link.direct_path) {
+                return link->link.path_link.direct_path;
+            }
+
+            return strcat(strdup("-L"), strcat(link->link.path_link.dir_name, strcat(strdup(" -l"), link->link.path_link.dep_name)));
+        case Link_Framework:
+            return strcat(strdup("-framework "), link->link.framework.dep_name);
+    }
+}
+
+// --== Build Implementation ==--
+
+void initCommon(Build* build) {
+    const char* syms = "/sym_links";
+    build->sym_link_dir_ = strdup(build->build_dir_);
+    build->sym_link_dir_ = (char*)realloc(build->sym_link_dir_, strlen(build->sym_link_dir_) + strlen(syms) + 1);
+    strcat(build->sym_link_dir_, syms);
+
+    Command* create_sym_link_dir = newCommand(3, "mkdir", "-p", build->sym_link_dir_);
+    cmdPrint(create_sym_link_dir);
+    cmdExec(create_sym_link_dir);
+    freeCommand(create_sym_link_dir);
+
+    VectorPushBack(BuildStep, &build->build_steps_, (BuildStep){0});
+
+    BuildStep* step = &build->build_steps_.ptr[build->build_steps_.len - 1];
+    step->pre_step_commands = (CmdVec){0};
+    step->comp_flags = (StrVec){0};
+    step->link_flags = (StrVec){0};
+    step->links = (LinkVec){0};
+    step->includes = (IncludeVec){0};
+    step->objects = (ObjVec){0};
+
+    build->skip_compile_commands = false;
+    build->jobs_ = 1;
+    build->thread_queues_ = (BuildJobVec){0};
+
+    build->builtin = (Builtin){
+        .os = Os_Invalid,
+        .mode = Mode_Release,
+    };
+
+#if defined(__linux__)
+    build->builtin.os = Os_Linux;
+#elif defined(__APPLE__)
+    build->builtin.os = Os_MacOS;
+#elif defined(__WIN32)
+    build->builtin.os = Os_Windows;
+#elif defined(__WIN64)
+    build->builtin.os = Os_Windows;
+#endif
+
+    // Argparse
+    for (size_t i = 0; i < build->argc; i++) {
+        char* arg = build->argv[i];
+
+        if (strcmp(arg, "-Debug") == 0) {
+            build->builtin.mode = Mode_Debug;
+        }
+
+        if (strcmp(arg, "-j") == 0) {
+            i++;
+            errno = 0;
+            char* end;
+            long threads = strtol(arg, &end, 10);
+
+            if (arg == end) {
+                continue;
+            } else if (errno == ERANGE) {
+                printf("%s is not a valid number of jobs\n", arg);
+                exit(1);
+            } else if (*end != '\0') {
+                printf("Error: extra characters after number of jobs: %s\n", end);
+                exit(1);
+            }
+
+            build->jobs_ = threads;
+        }
+    }
+}
+
+Build* newBuild(const char* dir_name, int argc, char** argv) {
+    Build* build = (Build*)calloc(1, sizeof(Build));
+
+    build->argc = argc;
+    build->argv = argv;
+    build->build_dir_ = expandPath(dir_name);
+    build->compiler_ = (char*)DEFAULT_COMPILER;
+
+    initCommon(build);
+
+    return build;
+}
+
+Build* newBuildWithCompiler(const char* dir_name, char* compiler, int argc, char** argv) {
+    Build* build = (Build*)calloc(1, sizeof(Build));
+
+    build->argc = argc;
+    build->argv = argv;
+    build->build_dir_ = expandPath(dir_name);
+    build->compiler_ = compiler;
+
+    initCommon(build);
+
+    return build;
+}
+
+void freeBuild(Build* build) {
+    for (int i = 0; i < build->build_steps_.len; i++) {
+        BuildStep* step = &build->build_steps_.ptr[i];
+
+        //                                          SO META OMG
+        for (int c = 0; c < step->pre_step_commands.len; c++) {
+            freeCommand(&step->pre_step_commands.ptr[c]);
+        }
+        VectorFree(&step->pre_step_commands);
+
+        for (int o = 0; o < step->objects.len; o++) {
+            destroyObject(&step->objects.ptr[o]);
+        }
+        VectorFree(&step->objects);
+
+        for (int i = 0; i < step->includes.len; i++) {
+            destroyInclude(&step->includes.ptr[i]);
+        }
+        VectorFree(&step->includes);
+
+        for (int l = 0; l < step->links.len; l++) {
+            freeLink(&step->links.ptr[l]);
+        }
+        VectorFree(&step->links);
+
+        VectorFree(&step->comp_flags);
+        VectorFree(&step->link_flags);
+    }
+    VectorFree(&build->build_steps_);
+    VectorFree(&build->thread_queues_);
+
+    free(build->sym_link_dir_);
+    free(build->build_dir_);
+    free(build);
+}
+
+void rebuildYourself(Build* build) {
+    const char* build_c = "build.c";
+    const char* build_h = "build.h";
+#ifdef _WIN32
+    const char* build_exe = "build.exe";
+#else
+    const char* build_exe = "build";
+#endif
+
+    struct stat build_c_attr;
+    struct stat build_h_attr;
+
+    if (stat(build_c, &build_c_attr) != 0 || stat(build_h, &build_h_attr) != 0) {
+        printf("Error: build.c or build.h file not found");
+        exit(1);
+    }
+
+    time_t build_c_time = build_c_attr.st_mtime;
+    time_t build_h_time = build_h_attr.st_mtime;
+
+    bool rebuild = false;
+    struct stat build_exe_attr;
+    if (stat(build_exe, &build_exe_attr) == 0) {
+        time_t build_exe_time = build_exe_attr.st_mtime;
+
+        if (build_c_time > build_exe_time || build_h_time > build_exe_time) {
+            rebuild = true;
+        }
+    } else {
+        rebuild = true;
+    }
+
+    if (rebuild) {
+        printf("Rebuilding build system...\n");
+        Command* cmd = newCommand(5, build->compiler_, "-std=c23", build_c, "-o", build_exe);
+        cmdPrint(cmd);
+
+        int result = cmdExec(cmd);
+        freeCommand(cmd);
+
+        if (result != 0) {
+            printf("Build System rebuild failed\n");
+            exit(1);
+        }
+
+#ifdef __WIN32
+        Command* run_cmd = newCommand(1, ".\\build.exe");
+#else
+        Command* run_cmd = newCommand(1, "./build");
+#endif
+
+        for (int i = 1; i < build->argc; i++) {
+            cmdPushBack(run_cmd, build->argv[i]);
+        }
+
+        cmdExec(run_cmd);
+        exit(0);
+    }
+}
+
+void buildExportCompileCommands(Build* build, CompCmdVec* compile_commands) {
+    if (build->skip_compile_commands) {
+        return;
+    }
+
+    FILE* compile_commands_file = fopen("compile_commands.json", "w");
+    if (!compile_commands_file) {
+        printf("Failed to open compile_commands.json");
+        return;
+    }
+
+    fprintf(compile_commands_file, "[\n");
+
+    for (size_t i = 0; i < compile_commands->len; i++) {
+        compCmdAddToFile(&compile_commands->ptr[i], compile_commands_file);
+        if (i < compile_commands->len) {
+            fprintf(compile_commands_file, ",\n");
+        } else {
+            fprintf(compile_commands_file, "\n");
+        }
+    }
+
+    fprintf(compile_commands_file, "]");
+    fclose(compile_commands_file);
+}
+
+void buildSkipCompileCommands(Build* build) {
+    build->skip_compile_commands = true;
+}
+
+void buildAddPrebuildCommand(Build* build, Command* command) {
+    size_t build_step_index = build->build_steps_.len - 1;
+    CmdVec* vec = &build->build_steps_.ptr[build_step_index].pre_step_commands;
+    VectorPushBack(Command, vec, *command);
+}
+
+void buildAddObject(Build* build, Object* object) {
+    size_t build_step_index = build->build_steps_.len - 1;
+    ObjVec* vec = &build->build_steps_.ptr[build_step_index].objects;
+    VectorPushBack(Object, vec, *object);
+}
+
+void buildAddInclude(Build* build, Include* include) {
+    size_t build_step_index = build->build_steps_.len - 1;
+    IncludeVec* vec = &build->build_steps_.ptr[build_step_index].includes;
+    VectorPushBack(Include, vec, *include);
+}
+
+void buildAddLink(Build* build, Link* link) {
+    size_t build_step_index = build->build_steps_.len - 1;
+    LinkVec* vec = &build->build_steps_.ptr[build_step_index].links;
+    VectorPushBack(Link, vec, *link);
+}
+
+void buildAddCompilationFlag(Build* build, char* flag) {
+    size_t build_step_index = build->build_steps_.len - 1;
+    StrVec* vec = &build->build_steps_.ptr[build_step_index].comp_flags;
+    VectorPushBack(char*, vec, flag);
+}
+
+void buildAddLinkingFlag(Build* build, char* flag) {
+    size_t build_step_index = build->build_steps_.len - 1;
+    StrVec* vec = &build->build_steps_.ptr[build_step_index].link_flags;
+    VectorPushBack(char*, vec, flag);
+}
+
+void buildStep(Build* build) {
+    VectorPushBack(BuildStep, &build->build_steps_, (BuildStep){0});
+}
+
+typedef struct {
+        Build* build;
+        StrVec includes;
+        BuildStep* step;
+        StrVec* obj_files;
+        pthread_mutex_t* obj_mutex;
+        CompCmdVec* compile_cmds;
+        pthread_mutex_t* comp_cmd_mutex;
+        size_t job_number;
+} CompileThreadArgs;
+
+void* threadedCompile(void* arg) {
+    CompileThreadArgs* args = (CompileThreadArgs*)arg;
+    BuildJob* thread_queues = args->build->thread_queues_.ptr;
+    size_t jobs_len = args->build->thread_queues_.len;
+
+    ObjectQueue* q = thread_queues[args->job_number].objects;
+
+    bool queue_is_empty = q->start == q->end;
+    bool all_jobs_queued = thread_queues[args->job_number].all_jobs_queued;
+
+    while (!queue_is_empty || !all_jobs_queued) {
+        if (!queue_is_empty) {
+            pthread_mutex_lock(&thread_queues[args->job_number].mutex);
+            Object* obj = objQPop(thread_queues[args->job_number].objects);
+            pthread_mutex_unlock(&thread_queues[args->job_number].mutex);
+
+            size_t inc_len = 1;
+            for (size_t i = 0; i < args->includes.len; i++) {
+                inc_len += strlen(args->includes.ptr[i]) + 1;
+            }
+            char* includes_str = (char*)calloc(inc_len, sizeof(char));
+            for (size_t i = 0; i < args->includes.len; i++) {
+                char* inc = args->includes.ptr[i];
+                strcat(includes_str, inc);
+                strcat(includes_str, " ");
+            }
+
+            size_t comp_flags_len = 1;
+            for (size_t i = 0; i < args->step->comp_flags.len; i++) {
+                comp_flags_len += strlen(args->step->comp_flags.ptr[i]) + 1;
+            }
+            char* comp_flags_str = (char*)calloc(comp_flags_len, sizeof(char));
+            for (size_t i = 0; i < args->step->comp_flags.len; i++) {
+                char* flag = args->step->comp_flags.ptr[i];
+                strcat(comp_flags_str, flag);
+                strcat(comp_flags_str, " ");
+            }
+
+            compile(
+                obj,
+                args->build->compiler_,
+                comp_flags_str,
+                includes_str,
+                args->build->build_dir_,
+                args->obj_files,
+                args->obj_mutex,
+                args->compile_cmds,
+                args->comp_cmd_mutex
+            );
+        }
+
+        queue_is_empty = q->start == q->end;
+        all_jobs_queued = thread_queues[args->job_number].all_jobs_queued;
+    }
+
+    thread_queues[args->job_number].all_jobs_complete = true;
+
+    return nullptr;
+}
+
+void buildBuild(Build* build) {
+    for (size_t i = 0; i < build->jobs_; i++) {
+        BuildJob job = (BuildJob){
+            .mutex = PTHREAD_MUTEX_INITIALIZER,
+            .all_jobs_queued = false,
+            .all_jobs_complete = false,
+            .objects = newObjectQueue(100),
+        };
+
+        VectorPushBack(BuildJob, &build->thread_queues_, job);
+    }
+
+    CompCmdVec compile_commands = (CompCmdVec){0};
+    pthread_mutex_t comp_commands_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    for (int i = 0; i < build->build_steps_.len; i++) {
+        BuildStep* step = &build->build_steps_.ptr[i];
+        // Run any prebuild commands
+        for (int j = 0; j < step->pre_step_commands.len; j++) {
+            Command* cmd = &step->pre_step_commands.ptr[j];
+            cmdPrint(cmd);
+            int result = cmdExec(cmd);
+            freeCommand(cmd);
+            if (result != 0) {
+                printf("Error executing command\n");
+                exit(1);
+            }
+        }
+
+        // Create the build step include paths
+        StrVec includes = (StrVec){0};
+        for (int j = 0; j < step->includes.len; j++) {
+            Include* inc = &step->includes.ptr[j];
+
+            VectorPushBack(char*, &includes, strdup("-I"));
+            char* inc_path = allocIncludePath(inc, build->sym_link_dir_);
+            VectorPushBack(char*, &includes, inc_path);
+        }
+
+        StrVec object_files = (StrVec){0};
+        pthread_mutex_t obj_files_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+        pthread_t* threads = (pthread_t*)calloc(build->jobs_, sizeof(pthread_t));
+        CompileThreadArgs* args = (CompileThreadArgs*)calloc(build->jobs_, sizeof(CompileThreadArgs));
+
+        for (size_t t = 0; t < build->jobs_; t++) {
+            build->thread_queues_.ptr[t].all_jobs_queued = false;
+            build->thread_queues_.ptr[t].all_jobs_complete = false;
+
+            args[t] = (CompileThreadArgs){
+                build,
+                includes,
+                step,
+                &object_files,
+                &obj_files_mutex,
+                &compile_commands,
+                &comp_commands_mutex,
+                t
+            };
+
+            pthread_create(
+                &threads[t],
+                nullptr,
+                threadedCompile,
+                &args[t]
+            );
+        }
+
+        size_t job_index = 0;
+        for (size_t j = 0; j < step->objects.len; j++) {
+            Object* obj = &step->objects.ptr[j];
+            pthread_mutex_lock(&build->thread_queues_.ptr[job_index].mutex);
+            objQPush(build->thread_queues_.ptr[job_index].objects, obj);
+            pthread_mutex_unlock(&build->thread_queues_.ptr[job_index].mutex);
+
+            job_index = (job_index + 1) % build->jobs_;
+        }
+
+        // After the current job steps have been queued the let each thread know that
+        // there will be no more work
+        for (size_t j = 0; j < build->jobs_; j++) {
+            build->thread_queues_.ptr[j].all_jobs_queued = true;
+        }
+
+        for (size_t j = 0; j < build->jobs_; j++) {
+            pthread_join(threads[j], nullptr);
+        }
+
+        Command* linking_cmd = newCommand(1, build->compiler_);
+
+        if (step->link_flags.len == 0) {
+            cmdPushBack(linking_cmd, strdup("-std=c23"));
+        } else {
+            for (int k = 0; k < step->link_flags.len; k++) {
+                cmdPushBack(linking_cmd, strdup(step->link_flags.ptr[k]));
+            }
+        }
+
+        cmdPushBack(linking_cmd, strdup("-o"));
+        char* output_file;
+        asprintf(&output_file, "%s/main", build->build_dir_);
+        cmdPushBack(linking_cmd, output_file);
+
+        for (int k = 0; k < object_files.len; k++) {
+            cmdPushBack(linking_cmd, object_files.ptr[k]);
+        }
+
+        for (int k = 0; k < step->links.len; k++) {
+            char* linkable = allocLinkable(&step->links.ptr[k]);
+            cmdPushBack(linking_cmd, linkable);
+        }
+
+        cmdPrint(linking_cmd);
+        cmdExec(linking_cmd);
+
+        for (int j = 0; j < includes.len; j++) {
+            free(includes.ptr[j]);
+        }
+        VectorFree(&includes);
+        VectorFree(&object_files);
+
+        freeCommand(linking_cmd);
+        for (size_t i = 0; i < build->jobs_; i++) {
+            freeObjQueue(build->thread_queues_.ptr[i].objects);
+        }
+        free(threads);
+        free(args);
+    }
+
+    buildExportCompileCommands(build, &compile_commands);
+    for (size_t k = 0; k < compile_commands.len; k++) {
+        freeCompileCommand(&compile_commands.ptr[k]);
     }
 }
 
