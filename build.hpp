@@ -253,11 +253,14 @@ class Object {
                 deps_paths.push_back(std::filesystem::current_path() / dep);
             }
 
+            auto build_commands = build_command(build_dir);
+
             // Get the last modification time of the object file
-            std::filesystem::path object_path = build_dir / self_and_deps.first;
+            // std::filesystem::path object_path = build_dir / self_and_deps.first;
+            std::filesystem::path object_path = build_commands[3];
 
             Command cmd({compiler, flags, includes});
-            for (auto& command_arg : build_command(build_dir)) {
+            for (auto& command_arg : build_commands) {
                 cmd.push_back(command_arg);
             }
 

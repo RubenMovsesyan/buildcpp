@@ -291,6 +291,7 @@ void freeCommand(Command* cmd) {
     if (cmd->exec_dir) {
         free(cmd->exec_dir);
     }
+    free(cmd);
 }
 
 void cmdPushBack(Command* cmd, char* chain) {
@@ -401,6 +402,7 @@ CompileCommand newCompileCommand(Command* src_cmd, char* filepath) {
 void freeCompileCommand(CompileCommand* comp_cmd) {
     free(comp_cmd->dir);
     free(comp_cmd->src_cmd);
+    free(comp_cmd->file);
 }
 
 void compCmdAddToFile(CompileCommand* comp_cmd, FILE* file) {
@@ -414,22 +416,22 @@ void compCmdAddToFile(CompileCommand* comp_cmd, FILE* file) {
 }
 
 // --== Include Implementation ==--
-Include* newDirectInclude(const char* path) {
-    Include* inc = (Include*)calloc(1, sizeof(Include));
+Include newDirectInclude(const char* path) {
+    Include inc = {0};
 
-    inc->type = Include_Direct;
-    inc->include.direct = (DirectInclude){
+    inc.type = Include_Direct;
+    inc.include.direct = (DirectInclude){
         .include_path = allocExpandPath(path)
     };
 
     return inc;
 }
 
-Include* newSymbolicInclude(const char* path, const char* symbolic_dir) {
-    Include* inc = (Include*)calloc(1, sizeof(Include));
+Include newSymbolicInclude(const char* path, const char* symbolic_dir) {
+    Include inc = {0};
 
-    inc->type = Include_Symbolic;
-    inc->include.symbolic = (SymbolicInclude){
+    inc.type = Include_Symbolic;
+    inc.include.symbolic = (SymbolicInclude){
         .include_path = allocExpandPath(path),
         .symbolic_dir = strdup(symbolic_dir),
     };
@@ -493,12 +495,13 @@ char* allocRemoveFilenameExtension(char* filename) {
     return extended;
 }
 
-Object* newObject(const char* path) {
-    Object* obj = (Object*)calloc(1, sizeof(Object));
+Object newObject(const char* path) {
+    // Object* obj = (Object*)calloc(1, sizeof(Object));
+    Object obj = {0};
 
-    obj->src_path = allocExpandPath(path);
-    obj->filename = allocExtractFilename(obj->src_path);
-    obj->filename_no_ext = allocRemoveFilenameExtension(obj->filename);
+    obj.src_path = allocExpandPath(path);
+    obj.filename = allocExtractFilename(obj.src_path);
+    obj.filename_no_ext = allocRemoveFilenameExtension(obj.filename);
 
     return obj;
 }
@@ -632,14 +635,12 @@ char** allocBuildCommand(Object* obj, char* build_dir) {
 
     char* expanded_build_dir = allocExpandPath(build_dir);
 
-    char* new_path = strcat(expanded_build_dir, "/");
-    new_path = strcat(new_path, relative_path);
+    char* new_path = (char*)malloc(PATH_MAX);
+    snprintf(new_path, PATH_MAX, "%s/%s", expanded_build_dir, relative_path);
     char* filename_removed = removeFilename(new_path);
 
     Command* make_path = newCommand(3, "mkdir", "-p", filename_removed);
     cmdExec(make_path);
-    freeCommand(make_path);
-    free(filename_removed);
 
     new_path = replaceFileExt(new_path, "o");
 
@@ -650,6 +651,10 @@ char** allocBuildCommand(Object* obj, char* build_dir) {
     output[1] = strdup(relative_path);
     output[2] = strdup("-o");
     output[3] = new_path;
+
+    freeCommand(make_path);
+    free(filename_removed);
+    free(expanded_build_dir);
 
     return output;
 }
@@ -727,7 +732,8 @@ void compile(
 object_compile_cleanup:
     freeCommand(cmd);
     freeDependencyList(deps_list);
-    for (size_t i = 0; i < 2; i++) {
+    // Only Free the first 3 because the last one is owned by the obj_files vector
+    for (size_t i = 0; i < 3; i++) {
         free(build_commands[i]);
     }
     free(build_commands);
@@ -788,42 +794,42 @@ Object* objQPop(ObjectQueue* q) {
 
 // --== Link Implementation ==--
 
-Link* newDirectLink(const char* dep_name) {
-    Link* link = (Link*)calloc(1, sizeof(Link));
+Link newDirectLink(const char* dep_name) {
+    Link link = {0};
 
-    link->type = Link_Direct;
-    link->link.direct_link.dep_name = strdup(dep_name);
-
-    return link;
-}
-
-Link* newPathLink(const char* path) {
-    Link* link = (Link*)calloc(1, sizeof(Link));
-
-    link->type = Link_Path;
-    link->link.path_link.dir_name = nullptr;
-    link->link.path_link.direct_path = strdup(path);
-    link->link.path_link.dep_name = nullptr;
+    link.type = Link_Direct;
+    link.link.direct_link.dep_name = strdup(dep_name);
 
     return link;
 }
 
-Link* newPathLinkWithDep(const char* dep_name, const char* dir_name) {
-    Link* link = (Link*)calloc(1, sizeof(Link));
+Link newPathLink(const char* path) {
+    Link link = {0};
 
-    link->type = Link_Path;
-    link->link.path_link.dir_name = allocExpandPath(dir_name);
-    link->link.path_link.direct_path = nullptr,
-    link->link.path_link.dep_name = strdup(dep_name);
+    link.type = Link_Path;
+    link.link.path_link.dir_name = nullptr;
+    link.link.path_link.direct_path = strdup(path);
+    link.link.path_link.dep_name = nullptr;
 
     return link;
 }
 
-Link* newFramework(const char* dep_name) {
-    Link* link = (Link*)calloc(1, sizeof(Link));
+Link newPathLinkWithDep(const char* dep_name, const char* dir_name) {
+    Link link = {0};
 
-    link->type = Link_Framework;
-    link->link.framework.dep_name = strdup(dep_name);
+    link.type = Link_Path;
+    link.link.path_link.dir_name = allocExpandPath(dir_name);
+    link.link.path_link.direct_path = nullptr,
+    link.link.path_link.dep_name = strdup(dep_name);
+
+    return link;
+}
+
+Link newFramework(const char* dep_name) {
+    Link link = {0};
+
+    link.type = Link_Framework;
+    link.link.framework.dep_name = strdup(dep_name);
 
     return link;
 }
@@ -1099,22 +1105,22 @@ void buildAddPrebuildCommand(Build* build, Command* command) {
     VectorPushBack(Command, vec, *command);
 }
 
-void buildAddObject(Build* build, Object* object) {
+void buildAddObject(Build* build, Object object) {
     size_t build_step_index = build->build_steps_.len - 1;
     ObjVec* vec = &build->build_steps_.ptr[build_step_index].objects;
-    VectorPushBack(Object, vec, *object);
+    VectorPushBack(Object, vec, object);
 }
 
-void buildAddInclude(Build* build, Include* include) {
+void buildAddInclude(Build* build, Include include) {
     size_t build_step_index = build->build_steps_.len - 1;
     IncludeVec* vec = &build->build_steps_.ptr[build_step_index].includes;
-    VectorPushBack(Include, vec, *include);
+    VectorPushBack(Include, vec, include);
 }
 
-void buildAddLink(Build* build, Link* link) {
+void buildAddLink(Build* build, Link link) {
     size_t build_step_index = build->build_steps_.len - 1;
     LinkVec* vec = &build->build_steps_.ptr[build_step_index].links;
-    VectorPushBack(Link, vec, *link);
+    VectorPushBack(Link, vec, link);
 }
 
 void buildAddCompilationFlag(Build* build, char* flag) {
@@ -1193,6 +1199,9 @@ void* threadedCompile(void* arg) {
                 args->compile_cmds,
                 args->comp_cmd_mutex
             );
+
+            free(includes_str);
+            free(comp_flags_str);
         }
 
         queue_is_empty = q->start == q->end;
@@ -1295,14 +1304,14 @@ void buildBuild(Build* build) {
         Command* linking_cmd = newCommand(1, build->compiler_);
 
         if (step->link_flags.len == 0) {
-            cmdPushBack(linking_cmd, strdup("-std=c23"));
+            cmdPushBack(linking_cmd, "-std=c23");
         } else {
             for (int k = 0; k < step->link_flags.len; k++) {
-                cmdPushBack(linking_cmd, strdup(step->link_flags.ptr[k]));
+                cmdPushBack(linking_cmd, step->link_flags.ptr[k]);
             }
         }
 
-        cmdPushBack(linking_cmd, strdup("-o"));
+        cmdPushBack(linking_cmd, "-o");
         char* output_file;
         asprintf(&output_file, "%s/main", build->build_dir_);
         cmdPushBack(linking_cmd, output_file);
@@ -1323,6 +1332,10 @@ void buildBuild(Build* build) {
             free(includes.ptr[j]);
         }
         VectorFree(&includes);
+
+        for (int j = 0; j < object_files.len; j++) {
+            free(object_files.ptr[j]);
+        }
         VectorFree(&object_files);
 
         freeCommand(linking_cmd);
@@ -1331,12 +1344,14 @@ void buildBuild(Build* build) {
         }
         free(threads);
         free(args);
+        free(output_file);
     }
 
     buildExportCompileCommands(build, &compile_commands);
     for (size_t k = 0; k < compile_commands.len; k++) {
         freeCompileCommand(&compile_commands.ptr[k]);
     }
+    VectorFree(&compile_commands);
 }
 
 #endif // BUILD_H
