@@ -1,4 +1,3 @@
-#define BUILD_IMPLEMENTATION
 #include "build.h"
 
 const char* BUILD_DIR = ".build";

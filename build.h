@@ -62,19 +62,6 @@ typedef struct {
         char* exec_dir;
 } Command;
 
-// Init and deinit
-Command* newCommand(int count, ...);
-Command* newCommandFromDir(const char* exec_dir, int count, ...);
-void freeCommand(Command* cmd);
-
-void cmdPushBack(Command* cmd, char* chain);
-void cmdPrint(Command* cmd);
-
-char* allocString(Command* cmd);
-
-int cmdExec(Command* cmd);
-char* allocCmdExecAndCapture(Command* cmd);
-
 typedef Vector(Command) CmdVec;
 
 // --== (Compile Command Interface) ==--
@@ -84,10 +71,6 @@ typedef struct {
         char* dir;
         char* file;
 } CompileCommand;
-
-CompileCommand newCompileCommand(Command* src_cmd, char* filepath);
-void freeCompileCommand(CompileCommand* comp_cmd);
-void compCmdAddToFile(CompileCommand* comp_cmd, FILE* file);
 
 typedef Vector(CompileCommand) CompCmdVec;
 
@@ -115,12 +98,6 @@ typedef struct {
         } include;
 } Include;
 
-Include* newDirectInclude(const char* path);
-Include* newSymbolicInclude(const char* path, const char* symbolic_dir);
-void destroyInclude(Include* include);
-
-char* allocIncludePath(Include* inc, const char* symlinks_path);
-
 typedef Vector(Include) IncludeVec;
 
 // --== (Include Interface) ==--
@@ -130,23 +107,6 @@ typedef struct {
         char* filename;
         char* filename_no_ext;
 } Object;
-
-Object* newObject(const char* path);
-void destroyObject(Object* obj);
-char* allocObjectPath(Object* obj);
-DependencyList* objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes);
-char** allocBuildCommand(Object* obj, char* build_dir);
-void compile(
-    Object* obj,
-    char* compiler,
-    char* flags,
-    char* includes,
-    char* build_dir,
-    StrVec* obj_files,
-    pthread_mutex_t* obj_files_mutex,
-    CompCmdVec* compile_commands,
-    pthread_mutex_t* comp_cmd_mutex
-);
 
 typedef Vector(Object) ObjVec;
 
@@ -158,11 +118,6 @@ typedef struct {
         Object** end;
         size_t cap;
 } ObjectQueue;
-
-ObjectQueue* newObjectQueue(size_t cap);
-void objQPush(ObjectQueue* q, Object* obj);
-Object* objQPop(ObjectQueue* q);
-void freeObjQueue(ObjectQueue* q);
 
 // --== (Link Interface) ==--
 typedef struct {
@@ -194,13 +149,6 @@ typedef struct {
                 Framework framework;
         } link;
 } Link;
-
-Link* newDirectLink(const char* dep_name);
-Link* newPathLink(const char* path);
-Link* newPathLinkWithDep(const char* dep_name, const char* dir_name);
-Link* newFramework(const char* dep_name);
-void destroyLink(Link* link);
-char* allocLinkable(Link* link);
 
 typedef Vector(Link) LinkVec;
 
@@ -261,26 +209,6 @@ typedef struct {
         int argc;
         char** argv;
 } Build;
-
-void initCommon(Build* build);
-
-Build* newBuild(const char* dir_name, int argc, char** argv);
-Build* newBuildWithCompiler(const char* dir_name, char* compiler, int argc, char** argv);
-void freeBuild(Build* build);
-
-void rebuildYourself(Build* build);
-void buildExportCompileCommands(Build* build, CompCmdVec* compile_commands);
-void buildSkipCompileCommands(Build* build);
-void buildAddPrebuildCommand(Build* build, Command* command);
-void buildAddObject(Build* build, Object* object);
-void buildAddInclude(Build* build, Include* include);
-void buildAddLink(Build* build, Link* link);
-void buildAddCompilationFlag(Build* build, char* flag);
-void buildAddLinkingFlag(Build* build, char* flag);
-void buildStep(Build* build);
-void buildBuild(Build* build);
-
-// #ifdef BUILD_IMPLEMENTATION
 
 // --== Dependency List Implementation ==--
 
@@ -574,13 +502,6 @@ Object* newObject(const char* path) {
 
     return obj;
 }
-
-// void freeObject(Object* obj) {
-//     free(obj->src_path);
-//     free(obj->filename);
-//     free(obj->filename_no_ext);
-//     free(obj);
-// }
 
 void destroyObject(Object* obj) {
     free(obj->src_path);
@@ -940,6 +861,67 @@ char* allocLinkable(Link* link) {
 
 // --== Build Implementation ==--
 
+void rebuildYourself(Build* build) {
+    const char* build_c = "build.c";
+    const char* build_h = "build.h";
+#ifdef _WIN32
+    const char* build_exe = "build.exe";
+#else
+    const char* build_exe = "build";
+#endif
+
+    struct stat build_c_attr;
+    struct stat build_h_attr;
+
+    if (stat(build_c, &build_c_attr) != 0 || stat(build_h, &build_h_attr) != 0) {
+        printf("Error: build.c or build.h file not found");
+        exit(1);
+    }
+
+    time_t build_c_time = build_c_attr.st_mtime;
+    time_t build_h_time = build_h_attr.st_mtime;
+
+    bool rebuild = false;
+    struct stat build_exe_attr;
+    if (stat(build_exe, &build_exe_attr) == 0) {
+        time_t build_exe_time = build_exe_attr.st_mtime;
+
+        if (build_c_time > build_exe_time || build_h_time > build_exe_time) {
+            rebuild = true;
+        }
+    } else {
+        rebuild = true;
+    }
+
+    if (rebuild) {
+        printf("Rebuilding build system...\n");
+        Command* cmd = newCommand(5, build->compiler_, "-std=c23", build_c, "-o", build_exe);
+        cmdPrint(cmd);
+
+        int result = cmdExec(cmd);
+
+        if (result != 0) {
+            printf("Build System rebuild failed\n");
+            exit(1);
+        }
+
+#ifdef __WIN32
+        Command* run_cmd = newCommand(1, ".\\build.exe");
+#else
+        Command* run_cmd = newCommand(1, "./build");
+#endif
+
+        for (int i = 1; i < build->argc; i++) {
+            cmdPushBack(run_cmd, build->argv[i]);
+        }
+
+        cmdExec(run_cmd);
+        freeCommand(cmd);
+        freeCommand(run_cmd);
+        exit(0);
+    }
+}
+
 void initCommon(Build* build) {
     const char* syms = "/sym_links";
     build->sym_link_dir_ = strdup(build->build_dir_);
@@ -1071,67 +1053,6 @@ void freeBuild(Build* build) {
     free(build->sym_link_dir_);
     free(build->build_dir_);
     free(build);
-}
-
-void rebuildYourself(Build* build) {
-    const char* build_c = "build.c";
-    const char* build_h = "build.h";
-#ifdef _WIN32
-    const char* build_exe = "build.exe";
-#else
-    const char* build_exe = "build";
-#endif
-
-    struct stat build_c_attr;
-    struct stat build_h_attr;
-
-    if (stat(build_c, &build_c_attr) != 0 || stat(build_h, &build_h_attr) != 0) {
-        printf("Error: build.c or build.h file not found");
-        exit(1);
-    }
-
-    time_t build_c_time = build_c_attr.st_mtime;
-    time_t build_h_time = build_h_attr.st_mtime;
-
-    bool rebuild = false;
-    struct stat build_exe_attr;
-    if (stat(build_exe, &build_exe_attr) == 0) {
-        time_t build_exe_time = build_exe_attr.st_mtime;
-
-        if (build_c_time > build_exe_time || build_h_time > build_exe_time) {
-            rebuild = true;
-        }
-    } else {
-        rebuild = true;
-    }
-
-    if (rebuild) {
-        printf("Rebuilding build system...\n");
-        Command* cmd = newCommand(5, build->compiler_, "-std=c23", build_c, "-o", build_exe);
-        cmdPrint(cmd);
-
-        int result = cmdExec(cmd);
-
-        if (result != 0) {
-            printf("Build System rebuild failed\n");
-            exit(1);
-        }
-
-#ifdef __WIN32
-        Command* run_cmd = newCommand(1, ".\\build.exe");
-#else
-        Command* run_cmd = newCommand(1, "./build");
-#endif
-
-        for (int i = 1; i < build->argc; i++) {
-            cmdPushBack(run_cmd, build->argv[i]);
-        }
-
-        cmdExec(run_cmd);
-        freeCommand(cmd);
-        freeCommand(run_cmd);
-        exit(0);
-    }
 }
 
 void buildExportCompileCommands(Build* build, CompCmdVec* compile_commands) {
@@ -1411,5 +1332,4 @@ void buildBuild(Build* build) {
     }
 }
 
-// #endif // BUILD_IMPLEMENTATION
 #endif // BUILD_H
