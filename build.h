@@ -252,46 +252,45 @@ char* allocExpandPath(const char* path) {
     return expanded;
 }
 
-Command* newCommand(int count, ...) {
-    Command* cmd = (Command*)calloc(1, sizeof(Command));
+Command newCommand(int count, ...) {
+    Command cmd = {0};
 
     va_list args;
     va_start(args, count);
 
     for (int i = 0; i < count; i++) {
-        VectorPushBack(char*, &cmd->command_chain, va_arg(args, char*));
+        VectorPushBack(char*, &cmd.command_chain, va_arg(args, char*));
     }
 
     va_end(args);
 
-    cmd->exec_dir = nullptr;
+    cmd.exec_dir = nullptr;
 
     return cmd;
 }
 
-Command* newCommandFromDir(const char* exec_dir, int count, ...) {
-    Command* cmd = (Command*)calloc(1, sizeof(Command));
+Command newCommandFromDir(const char* exec_dir, int count, ...) {
+    Command cmd = {0};
 
     va_list args;
     va_start(args, count);
 
     for (int i = 0; i < count; i++) {
-        VectorPushBack(char*, &cmd->command_chain, va_arg(args, char*));
+        VectorPushBack(char*, &cmd.command_chain, va_arg(args, char*));
     }
 
     va_end(args);
 
-    cmd->exec_dir = allocExpandPath(exec_dir);
+    cmd.exec_dir = allocExpandPath(exec_dir);
 
     return cmd;
 }
 
-void freeCommand(Command* cmd) {
+void destroyCommand(Command* cmd) {
     VectorFree(&cmd->command_chain);
     if (cmd->exec_dir) {
         free(cmd->exec_dir);
     }
-    free(cmd);
 }
 
 void cmdPushBack(Command* cmd, char* chain) {
@@ -459,13 +458,13 @@ char* allocIncludePath(Include* inc, const char* symlinks_path) {
             char* symlink_path_expanded = allocExpandPath(symlinks_path);
             char sym_path[PATH_MAX];
             snprintf(sym_path, PATH_MAX, "%s/%s", symlink_path_expanded, inc->include.symbolic.symbolic_dir);
-            Command* create_symbolic_dir = newCommand(4, "ln", "-sfn", inc->include.symbolic.include_path, sym_path);
+            Command create_symbolic_dir = newCommand(4, "ln", "-sfn", inc->include.symbolic.include_path, sym_path);
 
-            cmdPrint(create_symbolic_dir);
-            cmdExec(create_symbolic_dir);
+            cmdPrint(&create_symbolic_dir);
+            cmdExec(&create_symbolic_dir);
 
             // Cleanup
-            freeCommand(create_symbolic_dir);
+            destroyCommand(&create_symbolic_dir);
             free(symlink_path_expanded);
 
             return strdup(sym_path);
@@ -550,9 +549,9 @@ char** splitWhitespace(const char* str, size_t* out_count) {
 }
 
 DependencyList* objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes) {
-    Command* dep_cmd = newCommand(5, compiler, flags, includes, "-MM", obj->src_path);
-    char* output = allocCmdExecAndCapture(dep_cmd);
-    freeCommand(dep_cmd);
+    Command dep_cmd = newCommand(5, compiler, flags, includes, "-MM", obj->src_path);
+    char* output = allocCmdExecAndCapture(&dep_cmd);
+    destroyCommand(&dep_cmd);
 
     if (!output) {
         return (DependencyList*)calloc(1, sizeof(DependencyList));
@@ -639,8 +638,8 @@ char** allocBuildCommand(Object* obj, char* build_dir) {
     snprintf(new_path, PATH_MAX, "%s/%s", expanded_build_dir, relative_path);
     char* filename_removed = removeFilename(new_path);
 
-    Command* make_path = newCommand(3, "mkdir", "-p", filename_removed);
-    cmdExec(make_path);
+    Command make_path = newCommand(3, "mkdir", "-p", filename_removed);
+    cmdExec(&make_path);
 
     new_path = replaceFileExt(new_path, "o");
 
@@ -652,7 +651,7 @@ char** allocBuildCommand(Object* obj, char* build_dir) {
     output[2] = strdup("-o");
     output[3] = new_path;
 
-    freeCommand(make_path);
+    destroyCommand(&make_path);
     free(filename_removed);
     free(expanded_build_dir);
 
@@ -677,14 +676,14 @@ void compile(
         includes
     );
 
-    Command* cmd = newCommand(3, compiler, flags, includes);
+    Command cmd = newCommand(3, compiler, flags, includes);
     char** build_commands = allocBuildCommand(obj, build_dir);
 
     for (int i = 0; i < 4; i++) {
-        cmdPushBack(cmd, build_commands[i]);
+        cmdPushBack(&cmd, build_commands[i]);
     }
 
-    CompileCommand comp_cmd = newCompileCommand(cmd, obj->src_path);
+    CompileCommand comp_cmd = newCompileCommand(&cmd, obj->src_path);
 
     pthread_mutex_lock(comp_cmd_mutex);
     VectorPushBack(CompileCommand, compile_commands, comp_cmd);
@@ -721,8 +720,8 @@ void compile(
         goto object_compile_cleanup;
     }
 
-    cmdPrint(cmd);
-    int ret_code = cmdExec(cmd);
+    cmdPrint(&cmd);
+    int ret_code = cmdExec(&cmd);
 
     if (ret_code != 0) {
         printf("Object file build failed\n");
@@ -730,7 +729,7 @@ void compile(
     }
 
 object_compile_cleanup:
-    freeCommand(cmd);
+    destroyCommand(&cmd);
     freeDependencyList(deps_list);
     // Only Free the first 3 because the last one is owned by the obj_files vector
     for (size_t i = 0; i < 3; i++) {
@@ -909,10 +908,10 @@ void rebuildYourself(Build* build) {
 
     if (rebuild) {
         printf("Rebuilding build system...\n");
-        Command* cmd = newCommand(5, build->compiler_, "-std=c23", build_c, "-o", build_exe);
-        cmdPrint(cmd);
+        Command cmd = newCommand(5, build->compiler_, "-std=c23", build_c, "-o", build_exe);
+        cmdPrint(&cmd);
 
-        int result = cmdExec(cmd);
+        int result = cmdExec(&cmd);
 
         if (result != 0) {
             printf("Build System rebuild failed\n");
@@ -920,18 +919,18 @@ void rebuildYourself(Build* build) {
         }
 
 #ifdef __WIN32
-        Command* run_cmd = newCommand(1, ".\\build.exe");
+        Command run_cmd = newCommand(1, ".\\build.exe");
 #else
-        Command* run_cmd = newCommand(1, "./build");
+        Command run_cmd = newCommand(1, "./build");
 #endif
 
         for (int i = 1; i < build->argc; i++) {
-            cmdPushBack(run_cmd, build->argv[i]);
+            cmdPushBack(&run_cmd, build->argv[i]);
         }
 
-        cmdExec(run_cmd);
-        freeCommand(cmd);
-        freeCommand(run_cmd);
+        cmdExec(&run_cmd);
+        destroyCommand(&cmd);
+        destroyCommand(&run_cmd);
         exit(0);
     }
 }
@@ -942,10 +941,10 @@ void initCommon(Build* build) {
     build->sym_link_dir_ = (char*)realloc(build->sym_link_dir_, strlen(build->sym_link_dir_) + strlen(syms) + 1);
     strcat(build->sym_link_dir_, syms);
 
-    Command* create_sym_link_dir = newCommand(3, "mkdir", "-p", build->sym_link_dir_);
-    cmdPrint(create_sym_link_dir);
-    cmdExec(create_sym_link_dir);
-    freeCommand(create_sym_link_dir);
+    Command create_sym_link_dir = newCommand(3, "mkdir", "-p", build->sym_link_dir_);
+    cmdPrint(&create_sym_link_dir);
+    cmdExec(&create_sym_link_dir);
+    destroyCommand(&create_sym_link_dir);
 
     VectorPushBack(BuildStep, &build->build_steps_, (BuildStep){0});
 
@@ -1039,7 +1038,7 @@ void freeBuild(Build* build) {
 
         //                                          SO META OMG
         for (int c = 0; c < step->pre_step_commands.len; c++) {
-            freeCommand(&step->pre_step_commands.ptr[c]);
+            destroyCommand(&step->pre_step_commands.ptr[c]);
         }
         VectorFree(&step->pre_step_commands);
 
@@ -1099,10 +1098,10 @@ void buildSkipCompileCommands(Build* build) {
     build->skip_compile_commands = true;
 }
 
-void buildAddPrebuildCommand(Build* build, Command* command) {
+void buildAddPrebuildCommand(Build* build, Command command) {
     size_t build_step_index = build->build_steps_.len - 1;
     CmdVec* vec = &build->build_steps_.ptr[build_step_index].pre_step_commands;
-    VectorPushBack(Command, vec, *command);
+    VectorPushBack(Command, vec, command);
 }
 
 void buildAddObject(Build* build, Object object) {
@@ -1301,32 +1300,32 @@ void buildBuild(Build* build) {
             pthread_join(threads[j], nullptr);
         }
 
-        Command* linking_cmd = newCommand(1, build->compiler_);
+        Command linking_cmd = newCommand(1, build->compiler_);
 
         if (step->link_flags.len == 0) {
-            cmdPushBack(linking_cmd, "-std=c23");
+            cmdPushBack(&linking_cmd, "-std=c23");
         } else {
             for (int k = 0; k < step->link_flags.len; k++) {
-                cmdPushBack(linking_cmd, step->link_flags.ptr[k]);
+                cmdPushBack(&linking_cmd, step->link_flags.ptr[k]);
             }
         }
 
-        cmdPushBack(linking_cmd, "-o");
+        cmdPushBack(&linking_cmd, "-o");
         char* output_file;
         asprintf(&output_file, "%s/main", build->build_dir_);
-        cmdPushBack(linking_cmd, output_file);
+        cmdPushBack(&linking_cmd, output_file);
 
         for (int k = 0; k < object_files.len; k++) {
-            cmdPushBack(linking_cmd, object_files.ptr[k]);
+            cmdPushBack(&linking_cmd, object_files.ptr[k]);
         }
 
         for (int k = 0; k < step->links.len; k++) {
             char* linkable = allocLinkable(&step->links.ptr[k]);
-            cmdPushBack(linking_cmd, linkable);
+            cmdPushBack(&linking_cmd, linkable);
         }
 
-        cmdPrint(linking_cmd);
-        cmdExec(linking_cmd);
+        cmdPrint(&linking_cmd);
+        cmdExec(&linking_cmd);
 
         for (int j = 0; j < includes.len; j++) {
             free(includes.ptr[j]);
@@ -1338,7 +1337,7 @@ void buildBuild(Build* build) {
         }
         VectorFree(&object_files);
 
-        freeCommand(linking_cmd);
+        destroyCommand(&linking_cmd);
         for (size_t i = 0; i < build->jobs_; i++) {
             freeObjQueue(build->thread_queues_.ptr[i].objects);
         }
