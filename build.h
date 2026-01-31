@@ -845,17 +845,25 @@ void destroyLink(Link* link) {
 }
 
 char* allocLinkable(Link* link) {
+    char* result;
     switch (link->type) {
         case Link_Direct:
-            return strcat(strdup("-l"), link->link.direct_link.dep_name);
+            asprintf(&result, "-l%s", link->link.direct_link.dep_name);
+            return result;
         case Link_Path:
             if (link->link.path_link.direct_path) {
-                return link->link.path_link.direct_path;
+                return strdup(link->link.path_link.direct_path);
             }
 
-            return strcat(strdup("-L"), strcat(link->link.path_link.dir_name, strcat(strdup(" -l"), link->link.path_link.dep_name)));
+            asprintf(
+                &result, "-L%s -l%s",
+                link->link.path_link.dir_name,
+                link->link.path_link.dep_name
+            );
+            return result;
         case Link_Framework:
-            return strcat(strdup("-framework "), link->link.framework.dep_name);
+            asprintf(&result, "-framework %s", link->link.framework.dep_name);
+            return result;
     }
 }
 
@@ -1219,7 +1227,6 @@ void buildBuild(Build* build) {
             cmdPrint(cmd);
             int result = cmdExec(cmd);
 
-            freeCommand(cmd);
             if (result != 0) {
                 printf("Error executing command\n");
                 exit(1);
