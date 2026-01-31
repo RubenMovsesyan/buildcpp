@@ -459,44 +459,6 @@ class Build {
 #endif
         }
 
-    public:
-        // The Build always starts with 1 build step
-        Build(const std::string& directory_name)
-            : build_dir_(directory_name), compiler_(DEFAULT_COMPILER) {
-            init_common();
-        }
-
-        Build(const std::string& directory_name, const std::string& compiler)
-            : build_dir_(directory_name), compiler_(compiler) {
-            init_common();
-        }
-
-        // delete the command, objects, includes, and links
-        ~Build() {
-            for (const auto& step : build_steps_) {
-                for (Command* cmd : step.pre_step_commands) {
-                    delete cmd;
-                }
-
-                for (Object* obj : step.objects) {
-                    delete obj;
-                }
-
-                for (Include* inc : step.includes) {
-                    delete inc;
-                }
-
-                for (Link* lnk : step.links) {
-                    delete lnk;
-                }
-            }
-
-            for (size_t i = 0; i < jobs_; i++) {
-                BuildJob* job = thread_queues_[i];
-                delete job;
-            }
-        }
-
         void rebuildYourself(int argc, char** argv) {
             std::filesystem::path build_cpp = "build.cpp";
             std::filesystem::path build_hpp = "build.hpp";
@@ -578,6 +540,48 @@ class Build {
             }
         }
 
+    public:
+        // The Build always starts with 1 build step
+        Build(const std::string& directory_name, int argc, char** argv)
+            : build_dir_(directory_name), compiler_(DEFAULT_COMPILER) {
+            init_common();
+            argParse(argc, argv);
+            rebuildYourself(argc, argv);
+        }
+
+        Build(const std::string& directory_name, const std::string& compiler, int argc, char** argv)
+            : build_dir_(directory_name), compiler_(compiler) {
+            init_common();
+            argParse(argc, argv);
+            rebuildYourself(argc, argv);
+        }
+
+        // delete the command, objects, includes, and links
+        ~Build() {
+            for (const auto& step : build_steps_) {
+                for (Command* cmd : step.pre_step_commands) {
+                    delete cmd;
+                }
+
+                for (Object* obj : step.objects) {
+                    delete obj;
+                }
+
+                for (Include* inc : step.includes) {
+                    delete inc;
+                }
+
+                for (Link* lnk : step.links) {
+                    delete lnk;
+                }
+            }
+
+            for (size_t i = 0; i < jobs_; i++) {
+                BuildJob* job = thread_queues_[i];
+                delete job;
+            }
+        }
+
         void skipCompileCommands() {
             skip_compile_commands = true;
         }
@@ -626,7 +630,6 @@ class Build {
             std::vector<CompileCommand> compile_commands;
             std::mutex compile_commands_mutex;
 
-            size_t job_index_ = 0;
             for (const auto& step : build_steps_) {
                 // Run any prebuild commands (these will be run not multithreaded)
                 for (const auto& command : step.pre_step_commands) {
@@ -690,6 +693,7 @@ class Build {
                 }
 
                 // Compile the objects
+                size_t job_index_ = 0;
                 for (const auto& object : step.objects) {
                     thread_queues_[job_index_]->mutex.lock();
                     thread_queues_[job_index_]->objects.push(object);

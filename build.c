@@ -5,7 +5,6 @@ const char* BUILD_DIR = ".build";
 
 int main(int argc, char** argv) {
     Build* build = newBuildWithCompiler(BUILD_DIR, "clang", argc, argv);
-    rebuildYourself(build);
 
     buildAddInclude(build, newDirectInclude("test_src"));
 

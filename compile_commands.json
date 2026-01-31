@@ -1,20 +1,17 @@
 [
 	{
 		"directory": "/Users/rmovs/dev/buildcpp",
-		"command": "clang  -I /Users/rmovs/dev/buildcpp/test_src  -c test_src/incs/foo.c -o /Users/rmovs/dev/buildcpp/.build/test_src/incs/foo.o ",
-		"file": "/Users/rmovs/dev/buildcpp/test_src/incs/foo.c"
-	}
-,
+		"command": "clang++ -std=c++23  -I test_src_cpp  -c test_src_cpp/incs/foo.cpp -o .build/incs/foo.o",
+		"file": "test_src_cpp/incs/foo.cpp"
+	},
 	{
 		"directory": "/Users/rmovs/dev/buildcpp",
-		"command": "clang  -I /Users/rmovs/dev/buildcpp/test_src  -c test_src/incs/bar.c -o /Users/rmovs/dev/buildcpp/.build/test_src/incs/bar.o ",
-		"file": "/Users/rmovs/dev/buildcpp/test_src/incs/bar.c"
-	}
-,
+		"command": "clang++ -std=c++23  -I test_src_cpp  -c test_src_cpp/incs/bar.cpp -o .build/incs/bar.o",
+		"file": "test_src_cpp/incs/bar.cpp"
+	},
 	{
 		"directory": "/Users/rmovs/dev/buildcpp",
-		"command": "clang  -I /Users/rmovs/dev/buildcpp/test_src  -c test_src/main.c -o /Users/rmovs/dev/buildcpp/.build/test_src/main.o ",
-		"file": "/Users/rmovs/dev/buildcpp/test_src/main.c"
+		"command": "clang++ -std=c++23  -I test_src_cpp  -c test_src_cpp/main.cpp -o .build/main.o",
+		"file": "test_src_cpp/main.cpp"
 	}
-,
 ]
