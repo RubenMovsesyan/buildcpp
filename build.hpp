@@ -62,7 +62,7 @@ class Command {
                 std::print("{} ", chain);
             }
 
-            std::println();
+            std::println("");
         }
 
         inline std::string string() {
