@@ -21,30 +21,30 @@
 #include <unistd.h>
 
 const char* DEFAULT_COMPILER = "clang";
+static atomic_bool build_success = true;
 
-#define Vector(type)    \
-    struct {            \
-            type* ptr;  \
-            size_t cap; \
-            size_t len; \
+#define Vector(type)                                                                               \
+    struct {                                                                                       \
+            type* ptr;                                                                             \
+            size_t cap;                                                                            \
+            size_t len;                                                                            \
     }
 
-#define VectorPushBack(type, vector, elem)                                               \
-    do {                                                                                 \
-        if ((vector)->len == (vector)->cap) {                                            \
-            if ((vector)->cap == 0) {                                                    \
-                (vector)->cap = 1;                                                       \
-            } else {                                                                     \
-                (vector)->cap *= 2;                                                      \
-            }                                                                            \
-            (vector)->ptr = (type*)realloc((vector)->ptr, (vector)->cap * sizeof(type)); \
-        }                                                                                \
-        (vector)->ptr[(vector)->len] = elem;                                             \
-        (vector)->len++;                                                                 \
+#define VectorPushBack(type, vector, elem)                                                         \
+    do {                                                                                           \
+        if ((vector)->len == (vector)->cap) {                                                      \
+            if ((vector)->cap == 0) {                                                              \
+                (vector)->cap = 1;                                                                 \
+            } else {                                                                               \
+                (vector)->cap *= 2;                                                                \
+            }                                                                                      \
+            (vector)->ptr = (type*)realloc((vector)->ptr, (vector)->cap * sizeof(type));           \
+        }                                                                                          \
+        (vector)->ptr[(vector)->len] = elem;                                                       \
+        (vector)->len++;                                                                           \
     } while (0)
 
-#define VectorFree(vector) \
-    free((vector)->ptr);
+#define VectorFree(vector) free((vector)->ptr);
 
 typedef Vector(char*) StrVec;
 
@@ -85,10 +85,7 @@ typedef struct {
         char* symbolic_dir;
 } SymbolicInclude;
 
-typedef enum {
-    Include_Direct,
-    Include_Symbolic
-} IncludeType;
+typedef enum { Include_Direct, Include_Symbolic } IncludeType;
 
 typedef struct {
         IncludeType type;
@@ -135,11 +132,7 @@ typedef struct {
         char* dep_name;
 } Framework;
 
-typedef enum {
-    Link_Direct,
-    Link_Path,
-    Link_Framework
-} LinkType;
+typedef enum { Link_Direct, Link_Path, Link_Framework } LinkType;
 
 typedef struct {
         LinkType type;
@@ -153,17 +146,9 @@ typedef struct {
 typedef Vector(Link) LinkVec;
 
 // --== (Build Interface) ==--
-typedef enum {
-    Os_Invalid,
-    Os_MacOS,
-    Os_Linux,
-    Os_Windows
-} Os;
+typedef enum { Os_Invalid, Os_MacOS, Os_Linux, Os_Windows } Os;
 
-typedef enum {
-    Mode_Release,
-    Mode_Debug
-} Mode;
+typedef enum { Mode_Release, Mode_Debug } Mode;
 
 typedef struct {
         Os os;
@@ -293,9 +278,7 @@ void destroyCommand(Command* cmd) {
     }
 }
 
-void cmdPushBack(Command* cmd, char* chain) {
-    VectorPushBack(char*, &cmd->command_chain, chain);
-}
+void cmdPushBack(Command* cmd, char* chain) { VectorPushBack(char*, &cmd->command_chain, chain); }
 
 void cmdPrint(Command* cmd) {
     for (int i = 0; i < cmd->command_chain.len; i++) {
@@ -419,9 +402,7 @@ Include newDirectInclude(const char* path) {
     Include inc = {0};
 
     inc.type = Include_Direct;
-    inc.include.direct = (DirectInclude){
-        .include_path = allocExpandPath(path)
-    };
+    inc.include.direct = (DirectInclude){.include_path = allocExpandPath(path)};
 
     return inc;
 }
@@ -457,8 +438,12 @@ char* allocIncludePath(Include* inc, const char* symlinks_path) {
         case Include_Symbolic:
             char* symlink_path_expanded = allocExpandPath(symlinks_path);
             char sym_path[PATH_MAX];
-            snprintf(sym_path, PATH_MAX, "%s/%s", symlink_path_expanded, inc->include.symbolic.symbolic_dir);
-            Command create_symbolic_dir = newCommand(4, "ln", "-sfn", inc->include.symbolic.include_path, sym_path);
+            snprintf(
+                sym_path, PATH_MAX, "%s/%s", symlink_path_expanded,
+                inc->include.symbolic.symbolic_dir
+            );
+            Command create_symbolic_dir =
+                newCommand(4, "ln", "-sfn", inc->include.symbolic.include_path, sym_path);
 
             cmdPrint(&create_symbolic_dir);
             cmdExec(&create_symbolic_dir);
@@ -511,9 +496,7 @@ void destroyObject(Object* obj) {
     free(obj->filename_no_ext);
 }
 
-char* allocObjectPath(Object* obj) {
-    return strdup(obj->src_path);
-}
+char* allocObjectPath(Object* obj) { return strdup(obj->src_path); }
 
 char** splitWhitespace(const char* str, size_t* out_count) {
     size_t cap = 8;
@@ -548,7 +531,8 @@ char** splitWhitespace(const char* str, size_t* out_count) {
     return result;
 }
 
-DependencyList* objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes) {
+DependencyList*
+objectListDependencies(Object* obj, const char* compiler, const char* flags, const char* includes) {
     Command dep_cmd = newCommand(5, compiler, flags, includes, "-MM", obj->src_path);
     char* output = allocCmdExecAndCapture(&dep_cmd);
     destroyCommand(&dep_cmd);
@@ -669,12 +653,7 @@ void compile(
     CompCmdVec* compile_commands,
     pthread_mutex_t* comp_cmd_mutex
 ) {
-    DependencyList* deps_list = objectListDependencies(
-        obj,
-        compiler,
-        flags,
-        includes
-    );
+    DependencyList* deps_list = objectListDependencies(obj, compiler, flags, includes);
 
     Command cmd = newCommand(3, compiler, flags, includes);
     char** build_commands = allocBuildCommand(obj, build_dir);
@@ -725,6 +704,7 @@ void compile(
 
     if (ret_code != 0) {
         printf("Object file build failed\n");
+        build_success = false;
         exit(1);
     }
 
@@ -818,8 +798,7 @@ Link newPathLinkWithDep(const char* dep_name, const char* dir_name) {
 
     link.type = Link_Path;
     link.link.path_link.dir_name = allocExpandPath(dir_name);
-    link.link.path_link.direct_path = nullptr,
-    link.link.path_link.dep_name = strdup(dep_name);
+    link.link.path_link.direct_path = nullptr, link.link.path_link.dep_name = strdup(dep_name);
 
     return link;
 }
@@ -861,9 +840,7 @@ char* allocLinkable(Link* link) {
             }
 
             asprintf(
-                &result, "-L%s -l%s",
-                link->link.path_link.dir_name,
-                link->link.path_link.dep_name
+                &result, "-L%s -l%s", link->link.path_link.dir_name, link->link.path_link.dep_name
             );
             return result;
         case Link_Framework:
@@ -938,7 +915,8 @@ void rebuildYourself(Build* build) {
 void initCommon(Build* build) {
     const char* syms = "/sym_links";
     build->sym_link_dir_ = strdup(build->build_dir_);
-    build->sym_link_dir_ = (char*)realloc(build->sym_link_dir_, strlen(build->sym_link_dir_) + strlen(syms) + 1);
+    build->sym_link_dir_ =
+        (char*)realloc(build->sym_link_dir_, strlen(build->sym_link_dir_) + strlen(syms) + 1);
     strcat(build->sym_link_dir_, syms);
 
     Command create_sym_link_dir = newCommand(3, "mkdir", "-p", build->sym_link_dir_);
@@ -1094,9 +1072,7 @@ void buildExportCompileCommands(Build* build, CompCmdVec* compile_commands) {
     fclose(compile_commands_file);
 }
 
-void buildSkipCompileCommands(Build* build) {
-    build->skip_compile_commands = true;
-}
+void buildSkipCompileCommands(Build* build) { build->skip_compile_commands = true; }
 
 void buildAddPrebuildCommand(Build* build, Command command) {
     size_t build_step_index = build->build_steps_.len - 1;
@@ -1134,9 +1110,7 @@ void buildAddLinkingFlag(Build* build, char* flag) {
     VectorPushBack(char*, vec, flag);
 }
 
-void buildStep(Build* build) {
-    VectorPushBack(BuildStep, &build->build_steps_, (BuildStep){0});
-}
+void buildStep(Build* build) { VectorPushBack(BuildStep, &build->build_steps_, (BuildStep){0}); }
 
 typedef struct {
         Build* build;
@@ -1188,15 +1162,8 @@ void* threadedCompile(void* arg) {
             }
 
             compile(
-                obj,
-                args->build->compiler_,
-                comp_flags_str,
-                includes_str,
-                args->build->build_dir_,
-                args->obj_files,
-                args->obj_mutex,
-                args->compile_cmds,
-                args->comp_cmd_mutex
+                obj, args->build->compiler_, comp_flags_str, includes_str, args->build->build_dir_,
+                args->obj_files, args->obj_mutex, args->compile_cmds, args->comp_cmd_mutex
             );
 
             free(includes_str);
@@ -1255,29 +1222,23 @@ void buildBuild(Build* build) {
         pthread_mutex_t obj_files_mutex = PTHREAD_MUTEX_INITIALIZER;
 
         pthread_t* threads = (pthread_t*)calloc(build->jobs_, sizeof(pthread_t));
-        CompileThreadArgs* args = (CompileThreadArgs*)calloc(build->jobs_, sizeof(CompileThreadArgs));
+        CompileThreadArgs* args =
+            (CompileThreadArgs*)calloc(build->jobs_, sizeof(CompileThreadArgs));
 
         for (size_t t = 0; t < build->jobs_; t++) {
             build->thread_queues_.ptr[t].all_jobs_queued = false;
             build->thread_queues_.ptr[t].all_jobs_complete = false;
 
-            args[t] = (CompileThreadArgs){
-                build,
-                includes,
-                step,
-                &object_files,
-                &obj_files_mutex,
-                &compile_commands,
-                &comp_commands_mutex,
-                t
-            };
+            args[t] = (CompileThreadArgs){build,
+                                          includes,
+                                          step,
+                                          &object_files,
+                                          &obj_files_mutex,
+                                          &compile_commands,
+                                          &comp_commands_mutex,
+                                          t};
 
-            pthread_create(
-                &threads[t],
-                nullptr,
-                threadedCompile,
-                &args[t]
-            );
+            pthread_create(&threads[t], nullptr, threadedCompile, &args[t]);
         }
 
         size_t job_index = 0;
@@ -1298,6 +1259,11 @@ void buildBuild(Build* build) {
 
         for (size_t j = 0; j < build->jobs_; j++) {
             pthread_join(threads[j], nullptr);
+        }
+
+        if (!build_success) {
+            printf("Build failed\n");
+            exit(1);
         }
 
         Command linking_cmd = newCommand(1, build->compiler_);
@@ -1325,7 +1291,10 @@ void buildBuild(Build* build) {
         }
 
         cmdPrint(&linking_cmd);
-        cmdExec(&linking_cmd);
+        int link_result = cmdExec(&linking_cmd);
+        if (link_result != 0) {
+            exit(1);
+        }
 
         for (int j = 0; j < includes.len; j++) {
             free(includes.ptr[j]);
