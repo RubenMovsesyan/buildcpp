@@ -1126,7 +1126,6 @@ typedef struct {
 void* threadedCompile(void* arg) {
     CompileThreadArgs* args = (CompileThreadArgs*)arg;
     BuildJob* thread_queues = args->build->thread_queues_.ptr;
-    size_t jobs_len = args->build->thread_queues_.len;
 
     ObjectQueue* q = thread_queues[args->job_number].objects;
 
