@@ -59,18 +59,18 @@ typedef double f64;
 static_assert(sizeof(f32) == 4, "Size of float must be 32-bits");
 static_assert(sizeof(f64) == 8, "Size of double must be 64-bits");
 
-#define MAX(a, b)                                                                                                                                    \
-    ({                                                                                                                                               \
-        __typeof__(a) _a = (a);                                                                                                                      \
-        __typeof__(b) _b = (b);                                                                                                                      \
-        _a > _b ? _a : _b;                                                                                                                           \
+#define MAX(a, b)               \
+    ({                          \
+        __typeof__(a) _a = (a); \
+        __typeof__(b) _b = (b); \
+        _a > _b ? _a : _b;      \
     })
 
-#define MIN(a, b)                                                                                                                                    \
-    ({                                                                                                                                               \
-        __typeof__(a) _a = (a);                                                                                                                      \
-        __typeof__(b) _b = (b);                                                                                                                      \
-        _a < _b ? _a : _b;                                                                                                                           \
+#define MIN(a, b)               \
+    ({                          \
+        __typeof__(a) _a = (a); \
+        __typeof__(b) _b = (b); \
+        _a < _b ? _a : _b;      \
     })
 
 #endif // COMMON_H
@@ -204,7 +204,7 @@ void __Log_impl(LogLevel level, const char* file, u32 line, const char* fmt, ...
 
 #endif // LOGGING_H
 
-#define __EmptyStruct                                                                                                                                \
+#define __EmptyStruct \
     struct {}
 
 // Arena Allocator for general use (internal use only)
@@ -267,26 +267,26 @@ char* arenaRealloc(char* data, usize old_size, usize size) {
 
 // --- Vector ---
 
-#define Vector(type)                                                                                                                                 \
-    struct {                                                                                                                                         \
-            type* items;                                                                                                                             \
-            usize len;                                                                                                                               \
-            usize cap;                                                                                                                               \
+#define Vector(type)     \
+    struct {             \
+            type* items; \
+            usize len;   \
+            usize cap;   \
     }
 
-#define VectorPushBack(type, vector, elem)                                                                                                           \
-    do {                                                                                                                                             \
-        if ((vector)->len == (vector)->cap) {                                                                                                        \
-            usize old_cap = (vector)->cap;                                                                                                           \
-            if ((vector)->cap == 0) {                                                                                                                \
-                (vector)->cap = 1;                                                                                                                   \
-            } else {                                                                                                                                 \
-                (vector)->cap *= 2;                                                                                                                  \
-            }                                                                                                                                        \
-            (vector)->items = (type*)arenaRealloc((char*)((vector)->items), old_cap * sizeof(type), (vector)->cap * sizeof(type));                   \
-        }                                                                                                                                            \
-        (vector)->items[(vector)->len] = elem;                                                                                                       \
-        (vector)->len++;                                                                                                                             \
+#define VectorPushBack(type, vector, elem)                                                                                         \
+    do {                                                                                                                           \
+        if ((vector)->len == (vector)->cap) {                                                                                      \
+            usize old_cap = (vector)->cap;                                                                                         \
+            if ((vector)->cap == 0) {                                                                                              \
+                (vector)->cap = 1;                                                                                                 \
+            } else {                                                                                                               \
+                (vector)->cap *= 2;                                                                                                \
+            }                                                                                                                      \
+            (vector)->items = (type*)arenaRealloc((char*)((vector)->items), old_cap * sizeof(type), (vector)->cap * sizeof(type)); \
+        }                                                                                                                          \
+        (vector)->items[(vector)->len] = elem;                                                                                     \
+        (vector)->len++;                                                                                                           \
     } while (0)
 
 // Util functions
@@ -1131,7 +1131,7 @@ void __rebuildYourself(Build* build) {
 
         Command cmd;
         if (build->builtin.mode == Mode_Debug) {
-            cmd = newCommand(build->__default_compiler, "-std=c23", "-g", "-O0", "-fsanitize=address", (char*)build_c, "-o", (char*)build_exe);
+            cmd = newCommand(build->__default_compiler, "-std=c23", "-g", "-O0", (char*)build_c, "-o", (char*)build_exe);
         } else {
             cmd = newCommand(build->__default_compiler, "-std=c23", (char*)build_c, "-o", (char*)build_exe);
         }
