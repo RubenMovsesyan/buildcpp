@@ -732,6 +732,7 @@ typedef struct {
         char* src_path;
         char* filename;
         char* filename_no_ext;
+        char* __link_path;
 } Object;
 
 Object newObject(char* path) {
@@ -800,6 +801,7 @@ char** __objBuildCommand(Object* obj, char* build_dir) {
     cmdExec(&make_path);
 
     new_path = __replaceFileExt(new_path, "o");
+    obj->__link_path = new_path;
 
     char** output = (char**)arenaCalloc(4 * sizeof(char*));
 
@@ -1031,6 +1033,13 @@ typedef Vector(Include) __IncVec;
 
 typedef Vector(Object) __ObjVec;
 
+typedef struct {
+        usize step;
+        usize object;
+} LinkedObject;
+
+typedef Vector(LinkedObject) __LinkedObjVec;
+
 typedef Vector(Link) __LinkVec;
 
 typedef struct {
@@ -1039,6 +1048,7 @@ typedef struct {
         __CmdVec pre_step_commands;
         __IncVec includes;
         __ObjVec objects;
+        __LinkedObjVec linked_objects;
         __LinkVec links;
         __StrVec comp_flags;
         __StrVec link_flags;
@@ -1325,11 +1335,16 @@ void buildAddPrebuildCommand(Build* build, Command command) {
  *
  * @param build Pointer to the Build structure to modify
  * @param obj The Object representing a source file to compile
+ * @return Pointer to the Object that was added to the build step
  */
-void buildAddObject(Build* build, Object obj) {
+LinkedObject buildAddObject(Build* build, Object obj) {
     size_t build_step_index = build->__build_steps.len - 1;
     __ObjVec* vec = &build->__build_steps.items[build_step_index].objects;
     VectorPushBack(Object, vec, obj);
+    return (LinkedObject){
+        .step = build_step_index,
+        .object = vec->len - 1,
+    };
 }
 
 /**
@@ -1397,6 +1412,27 @@ void buildAddLinkingFlag(Build* build, char* flag) {
     size_t build_step_index = build->__build_steps.len - 1;
     __StrVec* vec = &build->__build_steps.items[build_step_index].link_flags;
     VectorPushBack(char*, vec, flag);
+}
+
+/**
+ * @brief Links a previously compiled object file to the current build step.
+ *
+ * This function adds a compiled object file's path as a linking flag to the
+ * current build step. The object must have been compiled first (have a valid
+ * __link_path) before it can be linked. This is useful when you need to link
+ * object files from previous build steps or when manually managing object
+ * file dependencies between different parts of your build.
+ *
+ * The function will terminate the build with a fatal error if the object
+ * has not been compiled yet (no __link_path available).
+ *
+ * @param build Pointer to the Build structure to modify
+ * @param obj Pointer to the Object that has been compiled and should be linked
+ */
+void buildAddLinkedObject(Build* build, LinkedObject obj) {
+    usize build_step_index = build->__build_steps.len - 1;
+    __LinkedObjVec* linked_objects = &build->__build_steps.items[build_step_index].linked_objects;
+    VectorPushBack(LinkedObject, linked_objects, obj);
 }
 
 /**
@@ -1681,9 +1717,22 @@ void buildBuild(Build* build) {
             snprintf(output_file, PATH_MAX, "%s/%s", build->__build_dir, step->output_file);
             cmdPushBack(&linking_cmd, output_file);
 
-            // Add all the objetc files
+            // Add all the object files
             for (usize i = 0; i < object_files.len; i++) {
                 cmdPushBack(&linking_cmd, object_files.items[i]);
+            }
+
+            // Add all the linked object files
+            for (usize i = 0; i < step->linked_objects.len; i++) {
+                LinkedObject linked_object = step->linked_objects.items[i];
+
+                Object* object = &build->__build_steps.items[linked_object.step].objects.items[linked_object.object];
+
+                if (object->__link_path == nullptr) {
+                    RLOG(LL_FATAL, "Object %s has no linked path... Object has not been compiled yet", object->src_path);
+                }
+
+                cmdPushBack(&linking_cmd, object->__link_path);
             }
 
             // Link everything that is needed
