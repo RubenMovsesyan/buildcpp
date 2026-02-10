@@ -1541,7 +1541,7 @@ void* __threadedCompile(void* arg) {
 
             // Concatenate all the includes into 1 string
             usize includes_cap = MAX(1, PATH_MAX * args->includes.len);
-            char* includes_str = (char*)arenaCalloc(PATH_MAX * args->includes.len);
+            char* includes_str = (char*)arenaCalloc(includes_cap);
             usize includes_offset = 0;
             for (usize i = 0; i < args->includes.len; i++) {
                 char* inc = args->includes.items[i];
@@ -1558,7 +1558,7 @@ void* __threadedCompile(void* arg) {
 
             // Concatenate all the compilation flags into 1 string
             usize flags_cap = MAX(1, PATH_MAX * args->step->comp_flags.len);
-            char* comp_flags_str = (char*)arenaCalloc(PATH_MAX * args->step->comp_flags.len);
+            char* comp_flags_str = (char*)arenaCalloc(flags_cap);
             usize flags_offset = 0;
             for (usize i = 0; i < args->step->comp_flags.len; i++) {
                 char* flag = args->step->comp_flags.items[i];
