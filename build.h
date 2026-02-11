@@ -214,6 +214,8 @@ typedef struct {
         usize capacity;
 } __Arena;
 
+pthread_mutex_t __arena_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static __Arena __arena = {nullptr, 0, 0};
 static bool build_success = true;
 
@@ -221,6 +223,7 @@ void initArena(usize size) { __arena = (__Arena){.data = (char*)malloc(size), .o
 void freeArena() { free(__arena.data); }
 
 char* arenaAlloc(usize size) {
+    pthread_mutex_lock(&__arena_mutex);
     if (__arena.data == nullptr && __arena.capacity == 0 && __arena.offset == 0) {
         RLOG(LL_FATAL, "Arena must be initialized before the build script can run");
     }
@@ -233,6 +236,7 @@ char* arenaAlloc(usize size) {
 
     char* ret = __arena.data + __arena.offset;
     __arena.offset += size;
+    pthread_mutex_unlock(&__arena_mutex);
     return ret;
 }
 
@@ -254,11 +258,14 @@ char* arenaRealloc(char* data, usize old_size, usize size) {
         RLOG(LL_FATAL, "data pointer is not part of the arena");
     }
 
+    pthread_mutex_lock(&__arena_mutex);
     if (data + old_size == __arena.data + __arena.offset) {
         // Extend in place
         __arena.offset += (size - old_size);
+        pthread_mutex_unlock(&__arena_mutex);
         return data;
     }
+    pthread_mutex_unlock(&__arena_mutex);
 
     char* new_data = (char*)arenaAlloc(size);
     memcpy(new_data, data, old_size);
@@ -443,17 +450,21 @@ Command _newCommandFromDir_impl(char* exec_dir, usize count, ...) {
     va_list args;
     va_start(args, count);
 
-    cmd._chain_capcity = count;
-    cmd._chain_offset = count;
-    cmd.command_chain = (char**)arenaAlloc(count * sizeof(char*));
+    cmd._chain_capcity = count + 3;
+    cmd._chain_offset = count + 3;
+    cmd.command_chain = (char**)arenaAlloc((count + 3) * sizeof(char*));
+    cmd.exec_dir = __expandPath(exec_dir);
 
-    for (u32 i = 0; i < count; i++) {
+    cmd.command_chain[0] = "cd";
+    cmd.command_chain[1] = cmd.exec_dir;
+    cmd.command_chain[2] = "&&";
+
+    for (u32 i = 3; i < count + 3; i++) {
         cmd.command_chain[i] = va_arg(args, char*);
     }
 
     va_end(args);
 
-    cmd.exec_dir = __expandPath(exec_dir);
 
     return cmd;
 }
@@ -477,30 +488,6 @@ usize __getTerminalWidth() {
     }
 
     return w.ws_col;
-}
-
-void cmdPrint(Command* cmd) {
-    RLOG(LL_DEBUG, "cmdPrint: command_chain=%p, _chain_offset=%zu", (void*)cmd->command_chain, cmd->_chain_offset);
-    // Just don't print paths longer than PATH_MAX
-    char command_buffer[PATH_MAX] = {0};
-    usize cols = __getTerminalWidth();
-
-    usize cmd_buf_offset = 0;
-    for (usize i = 0; i < cmd->_chain_offset; i++) {
-        if (cmd->command_chain[i]) {
-            usize chain_len = strlen(cmd->command_chain[i]);
-            if (cmd_buf_offset + chain_len > cols - 10 /* for elipses and log val */) {
-                strcat(command_buffer, "...");
-                break;
-            }
-
-            strcat(command_buffer, cmd->command_chain[i]);
-            strcat(command_buffer, " ");
-            cmd_buf_offset += chain_len + 1;
-        }
-    }
-
-    RLOG(LL_INFO, "%s", command_buffer);
 }
 
 // ! Internal use only
@@ -535,6 +522,40 @@ void __cmdSnprint(Command* cmd, usize size, char* buffer) {
     }
 }
 
+void cmdPrint(Command* cmd) {
+    RLOG(LL_DEBUG, "cmdPrint: command_chain=%p, _chain_offset=%zu", (void*)cmd->command_chain, cmd->_chain_offset);
+    // Just don't print paths longer than PATH_MAX
+    char command_buffer[PATH_MAX] = {0};
+    usize cols = __getTerminalWidth();
+
+    // print the full path if we are verbose logging
+    if (__log_verbose) {
+        usize cmd_len = __cmdlen(cmd);
+        char* command = (char*)arenaAlloc(cmd_len);
+        __cmdSnprint(cmd, cmd_len, command);
+        RLOG(LL_TRACE, "%s", command);
+    }
+
+    usize cmd_buf_offset = 0;
+    for (usize i = 0; i < cmd->_chain_offset; i++) {
+        if (cmd->command_chain[i]) {
+            usize chain_len = strlen(cmd->command_chain[i]);
+            if (cmd_buf_offset + chain_len > cols - 10 /* for elipses and log val */) {
+                strcat(command_buffer, "...");
+                break;
+            }
+
+            strcat(command_buffer, cmd->command_chain[i]);
+            strcat(command_buffer, " ");
+            cmd_buf_offset += chain_len + 1;
+        }
+    }
+
+    RLOG(LL_INFO, "%s", command_buffer);
+}
+
+
+
 // ! Internal use only
 struct __cmd_exec_output {
         char* captured;
@@ -546,12 +567,12 @@ struct __cmd_exec_output {
 
     struct __cmd_exec_output out = {0};
 
-    char cwd[PATH_MAX];
-    getcwd(cwd, sizeof(cwd));
+    // char cwd[PATH_MAX];
+    // getcwd(cwd, sizeof(cwd));
 
-    if (cmd->exec_dir) {
-        chdir(cmd->exec_dir);
-    }
+    // if (cmd->exec_dir) {
+    //     chdir(cmd->exec_dir);
+    // }
 
     usize cmd_len = __cmdlen(cmd);
     const char* capture_stderr = " 2>&1";
@@ -587,9 +608,9 @@ struct __cmd_exec_output {
         RLOG(LL_FATAL, "Command execution failed");
     }
 
-    if (cmd->exec_dir) {
-        chdir(cwd);
-    }
+    // if (cmd->exec_dir) {
+    //     chdir(cwd);
+    // }
 
     return out;
 }
@@ -599,14 +620,15 @@ u32 cmdExec(Command* cmd) {
         RLOG(LL_FATAL, "Command chain is empty");
     }
 
-    char cwd[PATH_MAX];
-    getcwd(cwd, sizeof(cwd));
+    // char cwd[PATH_MAX];
+    // getcwd(cwd, sizeof(cwd));
 
-    if (cmd->exec_dir) {
-        chdir(cmd->exec_dir);
-    }
+    // if (cmd->exec_dir) {
+    //     chdir(cmd->exec_dir);
+    // }
 
-    usize command_size = strlen(cmd->command_chain[0]) + 1;
+    // usize command_size = strlen(cmd->command_chain[0]) + 1;
+    usize command_size = __cmdlen(cmd);
     char* command = (char*)arenaCalloc(command_size);
     usize command_offset = 0;
 
@@ -624,9 +646,9 @@ u32 cmdExec(Command* cmd) {
 
     u32 result = system(command);
 
-    if (cmd->exec_dir) {
-        chdir(cwd);
-    }
+    // if (cmd->exec_dir) {
+    //     chdir(cwd);
+    // }
 
     return result;
 }
@@ -798,7 +820,11 @@ char** __objBuildCommand(Object* obj, char* build_dir) {
     char* filename_removed = __removeFilename(new_path);
     RLOG(LL_TRACE, "Filename removed: %s", filename_removed);
     Command make_path = newCommand("mkdir", "-p", filename_removed);
-    cmdExec(&make_path);
+    cmdPrint(&make_path);
+    u32 result = cmdExec(&make_path);
+    if (result != 0) {
+        RLOG(LL_FATAL, "Failed to create directory: %s", filename_removed);
+    }
 
     new_path = __replaceFileExt(new_path, "o");
     obj->__link_path = new_path;
@@ -898,7 +924,7 @@ typedef struct {
 __ObjectQueue __newObjectQueue(usize cap) {
     __ObjectQueue queue = {0};
 
-    queue.objects = (Object**)arenaAlloc(cap);
+    queue.objects = (Object**)arenaAlloc(cap * sizeof(Object*));
     queue.start = queue.objects;
     queue.end = queue.objects;
     queue.cap = cap;
@@ -915,12 +941,18 @@ void __objQPush(__ObjectQueue* q, Object* obj) {
 
     if (next_end == q->start) {
     build_h___objQPush__obj_q_push_rerun:
+        usize start_offset = q->start - q->objects;
+        usize end_offset = q->end - q->objects;
+
         q->objects = (Object**)arenaRealloc((char*)q->objects, q->cap * sizeof(Object*), q->cap * 2 * sizeof(Object*));
         q->cap *= 2;
 
         // Put the pointers back
-        q->start = q->objects + (q->start - q->objects);
-        q->end = q->objects + (q->end - q->objects);
+        // q->start = q->objects + (q->start - q->objects);
+        // q->end = q->objects + (q->end - q->objects);
+        q->start = q->objects + start_offset;
+        q->end = q->objects + end_offset;
+
         next_end = q->end + 1;
         if (next_end >= q->objects + q->cap) {
             goto build_h___objQPush__obj_q_push_rerun;
@@ -1225,8 +1257,10 @@ void __initCommon(Build* build) {
         if (strcmp(arg, "-j") == 0) {
             i++;
             errno = 0;
+            arg = build->__argv[i];
             char* end;
             build->__jobs = MAX(strtol(arg, &end, 10), 1);
+            RLOG(LL_DEBUG, "Number of jobs: %zu", build->__jobs);
 
             if (arg == end) {
                 continue;
@@ -1541,7 +1575,7 @@ void* __threadedCompile(void* arg) {
 
             // Concatenate all the includes into 1 string
             usize includes_cap = MAX(1, PATH_MAX * args->includes.len);
-            char* includes_str = (char*)arenaCalloc(includes_cap);
+            char* includes_str = (char*)arenaCalloc(PATH_MAX * args->includes.len);
             usize includes_offset = 0;
             for (usize i = 0; i < args->includes.len; i++) {
                 char* inc = args->includes.items[i];
@@ -1646,6 +1680,10 @@ void buildBuild(Build* build) {
         for (usize i = 0; i < build->__jobs; i++) {
             build->__build_jobs.items[i].all_jobs_queued = false;
             build->__build_jobs.items[i].all_jobs_complete = false;
+
+            // Reset queue pointers to clear any leftover objects
+            build->__build_jobs.items[i].objects.start = build->__build_jobs.items[i].objects.objects;
+            build->__build_jobs.items[i].objects.end = build->__build_jobs.items[i].objects.objects;
 
             args[i] = (__CompileThreadArgs){
                 .build = build,
