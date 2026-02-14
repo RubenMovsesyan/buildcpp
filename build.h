@@ -214,7 +214,7 @@ typedef struct {
         usize capacity;
 } __Arena;
 
-pthread_mutex_t __arena_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t __arena_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static __Arena __arena = {nullptr, 0, 0};
 static bool build_success = true;
@@ -224,19 +224,35 @@ void freeArena() { free(__arena.data); }
 
 char* arenaAlloc(usize size) {
     pthread_mutex_lock(&__arena_mutex);
+    RLOG(LL_TRACE, "Aquired Mutex");
+
+    usize alignment = sizeof(void*);
+
+    usize current_ptr = (usize)(__arena.data + __arena.offset);
+    usize padding = 0;
+    if (current_ptr % alignment != 0) {
+        padding = alignment - (current_ptr % alignment);
+    }
+
     if (__arena.data == nullptr && __arena.capacity == 0 && __arena.offset == 0) {
+        pthread_mutex_unlock(&__arena_mutex);
+        RLOG(LL_TRACE, "Released Mutex");
         RLOG(LL_FATAL, "Arena must be initialized before the build script can run");
     }
 
-    // TODO: Realloc arena
-    if (__arena.offset + size > __arena.capacity) {
+    if (__arena.offset + padding + size > __arena.capacity) {
         freeArena();
+        pthread_mutex_unlock(&__arena_mutex);
+        RLOG(LL_TRACE, "Released Mutex");
         RLOG(LL_FATAL, "Arena out of memory, use bigger arena size");
     }
+
+    __arena.offset += padding;
 
     char* ret = __arena.data + __arena.offset;
     __arena.offset += size;
     pthread_mutex_unlock(&__arena_mutex);
+    RLOG(LL_TRACE, "Released Mutex");
     return ret;
 }
 
@@ -253,19 +269,25 @@ char* arenaRealloc(char* data, usize old_size, usize size) {
         return arenaAlloc(size);
     }
 
+    RLOG(LL_TRACE, "Checking if data pointer is part of the arena");
+    pthread_mutex_lock(&__arena_mutex);
+    RLOG(LL_TRACE, "Aquired Mutex");
     if (data < __arena.data || data > __arena.data + __arena.capacity) {
         freeArena();
+        pthread_mutex_unlock(&__arena_mutex);
+        RLOG(LL_TRACE, "Released Mutex");
         RLOG(LL_FATAL, "data pointer is not part of the arena");
     }
 
-    pthread_mutex_lock(&__arena_mutex);
     if (data + old_size == __arena.data + __arena.offset) {
         // Extend in place
         __arena.offset += (size - old_size);
         pthread_mutex_unlock(&__arena_mutex);
+        RLOG(LL_TRACE, "Released Mutex");
         return data;
     }
     pthread_mutex_unlock(&__arena_mutex);
+    RLOG(LL_TRACE, "Released Mutex");
 
     char* new_data = (char*)arenaAlloc(size);
     memcpy(new_data, data, old_size);
@@ -313,7 +335,10 @@ char* __expandPath(char* path) {
         snprintf(expanded, PATH_MAX, "%s/%s", cwd, path);
     }
 
-    realpath(expanded, expanded);
+    char* resolved = (char*)arenaAlloc(PATH_MAX);
+    if (realpath(expanded, resolved) != nullptr) {
+        return resolved;
+    }
     return expanded;
 }
 
@@ -465,7 +490,6 @@ Command _newCommandFromDir_impl(char* exec_dir, usize count, ...) {
 
     va_end(args);
 
-
     return cmd;
 }
 #define newCommandFromDir(exec_dir, ...) _newCommandFromDir_impl(exec_dir, COUNT_STR_ARGS(__VA_ARGS__), __VA_ARGS__)
@@ -553,8 +577,6 @@ void cmdPrint(Command* cmd) {
 
     RLOG(LL_INFO, "%s", command_buffer);
 }
-
-
 
 // ! Internal use only
 struct __cmd_exec_output {
@@ -1173,7 +1195,7 @@ void __rebuildYourself(Build* build) {
 
         Command cmd;
         if (build->builtin.mode == Mode_Debug) {
-            cmd = newCommand(build->__default_compiler, "-std=c23", "-g", "-O0", "-fsanitize=address", (char*)build_c, "-o", (char*)build_exe);
+            cmd = newCommand(build->__default_compiler, "-std=c23", "-g", "-O0", (char*)build_c, "-o", (char*)build_exe);
         } else {
             cmd = newCommand(build->__default_compiler, "-std=c23", (char*)build_c, "-o", (char*)build_exe);
         }
@@ -1562,16 +1584,22 @@ void* __threadedCompile(void* arg) {
     __CompileThreadArgs* args = (__CompileThreadArgs*)arg;
     __BuildJob* build_jobs = args->build->__build_jobs.items;
 
+    pthread_mutex_lock(&build_jobs[args->job_number].mutex);
+    RLOG(LL_TRACE, "Locked jobs %d mutex", args->job_number);
     __ObjectQueue* q = &build_jobs[args->job_number].objects;
 
     bool q_is_empty = q->start == q->end;
+    pthread_mutex_unlock(&build_jobs[args->job_number].mutex);
+    RLOG(LL_TRACE, "Unlocked jobs %d mutex", args->job_number);
     bool all_jobs_queued = build_jobs[args->job_number].all_jobs_queued;
 
     while (!q_is_empty || !all_jobs_queued) {
         if (!q_is_empty) {
             pthread_mutex_lock(&build_jobs[args->job_number].mutex);
+            RLOG(LL_TRACE, "Locked jobs %d mutex", args->job_number);
             Object* obj = __objQPop(q);
             pthread_mutex_unlock(&build_jobs[args->job_number].mutex);
+            RLOG(LL_TRACE, "Unlocked jobs %d mutex", args->job_number);
 
             // Concatenate all the includes into 1 string
             usize includes_cap = MAX(1, PATH_MAX * args->includes.len);
@@ -1620,7 +1648,11 @@ void* __threadedCompile(void* arg) {
             );
         }
 
+        pthread_mutex_lock(&build_jobs[args->job_number].mutex);
+        RLOG(LL_TRACE, "Locked jobs %d mutex", args->job_number);
         q_is_empty = q->start == q->end;
+        pthread_mutex_unlock(&build_jobs[args->job_number].mutex);
+        RLOG(LL_TRACE, "Unlocked jobs %d mutex", args->job_number);
         all_jobs_queued = build_jobs[args->job_number].all_jobs_queued;
     }
 
@@ -1630,6 +1662,12 @@ void* __threadedCompile(void* arg) {
 }
 
 void buildBuild(Build* build) {
+    build->__build_jobs = (__BuildJobVec){
+        .items = (void*)arenaAlloc(sizeof(__BuildJob) * build->__jobs),
+        .len = 0,
+        .cap = build->__jobs,
+    };
+
     for (usize i = 0; i < build->__jobs; i++) {
         __BuildJob job = (__BuildJob){
             .all_jobs_queued = false,
