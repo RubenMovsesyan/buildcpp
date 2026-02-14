@@ -1589,9 +1589,9 @@ void* __threadedCompile(void* arg) {
     __ObjectQueue* q = &build_jobs[args->job_number].objects;
 
     bool q_is_empty = q->start == q->end;
+    bool all_jobs_queued = build_jobs[args->job_number].all_jobs_queued;
     pthread_mutex_unlock(&build_jobs[args->job_number].mutex);
     RLOG(LL_TRACE, "Unlocked jobs %d mutex", args->job_number);
-    bool all_jobs_queued = build_jobs[args->job_number].all_jobs_queued;
 
     while (!q_is_empty || !all_jobs_queued) {
         if (!q_is_empty) {
@@ -1651,9 +1651,9 @@ void* __threadedCompile(void* arg) {
         pthread_mutex_lock(&build_jobs[args->job_number].mutex);
         RLOG(LL_TRACE, "Locked jobs %d mutex", args->job_number);
         q_is_empty = q->start == q->end;
+        all_jobs_queued = build_jobs[args->job_number].all_jobs_queued;
         pthread_mutex_unlock(&build_jobs[args->job_number].mutex);
         RLOG(LL_TRACE, "Unlocked jobs %d mutex", args->job_number);
-        all_jobs_queued = build_jobs[args->job_number].all_jobs_queued;
     }
 
     build_jobs[args->job_number].all_jobs_complete = true;
