@@ -1069,7 +1069,7 @@ char* __linkable(Link* link) {
                 return link->link.path_link.direct_path;
             }
 
-            snprintf(result, MAX_LEN, "-L%s -l%s", link->link.path_link.dirname, link->dep_name);
+            snprintf(result, MAX_LEN, "-L%s -Wl,-rpath,%s -l%s", link->link.path_link.dirname, link->link.path_link.dirname, link->dep_name);
             break;
         case Link_Framework:
             snprintf(result, MAX_LEN, "-framework %s", link->dep_name);
