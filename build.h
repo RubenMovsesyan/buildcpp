@@ -1160,7 +1160,7 @@ const char* SYM_LINKS_PATH = "/sym_links";
 // ! Internal Use Only
 void __rebuildYourself(Build* build) {
     const char* build_c = "build.c";
-    const char* build_h = "build.h";
+    const char* build_h = __FILE__; // Resolves to wherever build.h was included from, e.g. a submodule dir
 
 #ifdef _WIN32
     const char* build_exe = "build.exe";
@@ -1770,28 +1770,36 @@ void buildBuild(Build* build) {
                 RLOG(LL_FATAL, "Output file not specified");
             }
 
-            Command linking_cmd;
-            if (step->compiler) {
-                linking_cmd = newCommand(step->compiler);
-            } else {
-                linking_cmd = newCommand(build->__default_compiler);
-            }
-
-            if (step->link_flags.len == 0) {
-                // TODO: review
-                // By default use the c23 standard
-                cmdPushBack(&linking_cmd, "-std=c23");
-            } else {
-                for (usize i = 0; i < step->link_flags.len; i++) {
-                    cmdPushBack(&linking_cmd, step->link_flags.items[i]);
-                }
-            }
-
-            cmdPushBack(&linking_cmd, "-o");
-
             char output_file[PATH_MAX];
             snprintf(output_file, PATH_MAX, "%s/%s", build->__build_dir, step->output_file);
-            cmdPushBack(&linking_cmd, output_file);
+
+            usize output_len = strlen(step->output_file);
+            bool archive = output_len > 2 && strcmp(step->output_file + output_len - 2, ".a") == 0;
+
+            Command linking_cmd;
+            if (archive) {
+                remove(output_file); // Rebuild from scratch so members of deleted sources don't linger
+                linking_cmd = newCommand("ar", "rcs", output_file);
+            } else {
+                if (step->compiler) {
+                    linking_cmd = newCommand(step->compiler);
+                } else {
+                    linking_cmd = newCommand(build->__default_compiler);
+                }
+
+                if (step->link_flags.len == 0) {
+                    // TODO: review
+                    // By default use the c23 standard
+                    cmdPushBack(&linking_cmd, "-std=c23");
+                } else {
+                    for (usize i = 0; i < step->link_flags.len; i++) {
+                        cmdPushBack(&linking_cmd, step->link_flags.items[i]);
+                    }
+                }
+
+                cmdPushBack(&linking_cmd, "-o");
+                cmdPushBack(&linking_cmd, output_file);
+            }
 
             // Add all the object files
             for (usize i = 0; i < object_files.len; i++) {
@@ -1811,9 +1819,12 @@ void buildBuild(Build* build) {
                 cmdPushBack(&linking_cmd, object->__link_path);
             }
 
-            // Link everything that is needed
-            for (usize i = 0; i < step->links.len; i++) {
-                cmdPushBack(&linking_cmd, __linkable(&step->links.items[i]));
+            // Link everything that is needed. ar takes no link flags, so consumers of the
+            // archive have to declare its links themselves
+            if (!archive) {
+                for (usize i = 0; i < step->links.len; i++) {
+                    cmdPushBack(&linking_cmd, __linkable(&step->links.items[i]));
+                }
             }
 
             // Execute the linking command
