@@ -560,6 +560,7 @@ inline void __Log_file_impl(const char* path, LogLevel level, const char* file, 
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -710,6 +711,8 @@ using Include = typename __IncludeTypeOf<Kind>::type;
 
 template <typename T>
 concept __IsInclude = std::same_as<T, __IncludeDirect> || std::same_as<T, __IncludeSymbolic>;
+
+using __IncludeVariant = std::variant<__IncludeDirect, __IncludeSymbolic>;
 
 struct CompileCommandEntry {
         std::filesystem::path directory;
@@ -1130,38 +1133,8 @@ class Output {
 };
 
 class Task;
+class BuildGroup;
 class Build;
-
-// Not just Object&: a group's includes_ tuple type varies per BuildGroup<Includes...>
-// instantiation, so this is the only generically-typed handle a task can hold onto its
-// owning group with. The group now owns the compiler (see BuildGroup), so these no
-// longer take one as a parameter.
-class __BuildGroupBase {
-    private:
-        // Set once the group is registered (see Build::addGroup). Non-virtual: unlike
-        // tasks()/includePaths()/compiler(), this doesn't vary per BuildGroup<Includes...>
-        // instantiation, so every group can just share the same storage here.
-        Build* build_ = nullptr;
-
-    public:
-        virtual ~__BuildGroupBase() = default;
-
-        virtual std::unordered_map<std::filesystem::path, std::unique_ptr<Task>>& tasks() = 0;
-        virtual std::vector<std::filesystem::path> includePaths(const std::filesystem::path& sym_links) = 0;
-        virtual std::string& compiler() = 0;
-        virtual const std::vector<std::string>& compileFlags() = 0;
-        virtual const std::vector<std::string>& linkFlags() = 0;
-        virtual std::vector<std::string> linkables() = 0;
-
-        // No-op if the group already has its own compiler (see BuildGroup's two
-        // constructors) — only fills in Build's default when one wasn't specified.
-        virtual void setDefaultCompiler(const std::string& compiler) = 0;
-
-        void setBuild(Build& build) { build_ = &build; }
-
-        // Defined out-of-line, after Build, since Build isn't a complete type yet here.
-        const std::filesystem::path& buildDir() const;
-};
 
 // A single task: owns the Output it produces (an Object, Binary, or Library), plus its
 // place in the dependency DAG. Set once the task is registered (see
@@ -1170,7 +1143,7 @@ class __BuildGroupBase {
 class Task {
     private:
         Output                    output_;
-        __BuildGroupBase*         group_ = nullptr;
+        BuildGroup*                group_ = nullptr;
         std::vector<Task*>        children_;
         std::vector<Task*>        parents_;
         std::atomic<i32>          parent_count_;
@@ -1186,30 +1159,16 @@ class Task {
             return *this;
         }
 
-        void setGroup(__BuildGroupBase& group) { group_ = &group; }
+        void setGroup(BuildGroup& group) { group_ = &group; }
 
         // True on success. CommandOutput's exit_code was previously discarded here —
-        // this is the one place that actually inspects it.
-        bool execute() {
-            std::filesystem::path build_dir = group_->buildDir();
-            std::filesystem::path sym_links = build_dir / "sym_links";
-            CommandOutput result = output_.execute(
-                group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir),
-                group_->compileFlags(), group_->linkFlags(), group_->linkables()
-            );
-            return result.exit_code == 0;
-        }
+        // this is the one place that actually inspects it. Defined out-of-line, after
+        // BuildGroup, since BuildGroup isn't a complete type yet here.
+        bool execute();
 
-        std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
-            std::filesystem::path sym_links = build_dir / "sym_links";
-            return output_.listDependencies(group_->compiler(), group_->includePaths(sym_links), group_->compileFlags());
-        }
+        std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir);
 
-        std::optional<CompileCommandEntry> compileCommandEntry() {
-            std::filesystem::path build_dir = group_->buildDir();
-            std::filesystem::path sym_links = build_dir / "sym_links";
-            return output_.compileCommandEntry(group_->compiler(), build_dir, group_->includePaths(sym_links), group_->compileFlags());
-        }
+        std::optional<CompileCommandEntry> compileCommandEntry();
 
         // Memoized: own staleness OR any parent's (recursive). Safe to call from
         // multiple worker threads without locking the cache — a task is only ever
@@ -1217,26 +1176,7 @@ class Task {
         // its own thread, and complete()'s atomic decrement of parent_count_ is what
         // publishes that thread's writes (including needs_rebuild_) before this task's
         // parentCount() is observed as 0 and it gets picked up.
-        bool needsRebuild() {
-            if (needs_rebuild_.has_value()) {
-                return *needs_rebuild_;
-            }
-
-            std::filesystem::path build_dir = group_->buildDir();
-            bool                  stale     = output_.isStale(build_dir, collectObjectFiles(build_dir));
-
-            if (!stale) {
-                for (Task* parent : parents_) {
-                    if (parent->needsRebuild()) {
-                        stale = true;
-                        break;
-                    }
-                }
-            }
-
-            needs_rebuild_ = stale;
-            return stale;
-        }
+        bool needsRebuild();
 
         const std::filesystem::path& sourcePath() const { return output_.sourcePath(); }
 
@@ -1294,26 +1234,39 @@ class Task {
         }
 };
 
-template <__IsInclude... Includes>
-class BuildGroup : public __BuildGroupBase {
+// Concrete (not templated on Include/Link kinds — see __IncludeVariant/__LinkVariant):
+// this is what lets Build own a homogeneous collection of these directly instead of
+// needing a type-erased base class.
+class BuildGroup {
     private:
         std::unordered_map<std::filesystem::path, std::unique_ptr<Task>> tasks_;
-        std::tuple<Includes...>                                          includes_;
+        std::vector<__IncludeVariant>                                    includes_;
         std::optional<std::string>                                       compiler_;
         std::vector<std::string>                                         compile_flags_;
         std::vector<std::string>                                         link_flags_;
         std::vector<__LinkVariant>                                       links_;
 
+        // Set once the group is registered (see Build::addGroup).
+        Build* build_ = nullptr;
+
     public:
-        BuildGroup(Includes... includes) : includes_(includes...) {}
-
-        BuildGroup(const std::string& compiler, Includes... includes) : includes_(includes...), compiler_(compiler) {}
-
-        void setDefaultCompiler(const std::string& compiler) override {
+        // No-op if the group already has its own compiler (see setCompiler) — only
+        // fills in Build's default when one wasn't explicitly set.
+        void setDefaultCompiler(const std::string& compiler) {
             if (!compiler_.has_value()) {
                 compiler_ = compiler;
             }
         }
+
+        void setCompiler(const std::string& compiler) { compiler_ = compiler; }
+
+        void setBuild(Build& build) { build_ = &build; }
+
+        // Defined out-of-line, after Build, since Build isn't a complete type yet here.
+        const std::filesystem::path& buildDir() const;
+
+        template <__IsInclude T>
+        void addInclude(T include) { includes_.emplace_back(std::move(include)); }
 
         void addCompileFlag(const std::string& flag) { compile_flags_.push_back(flag); }
 
@@ -1343,21 +1296,23 @@ class BuildGroup : public __BuildGroupBase {
             return new_task;
         }
 
-        std::unordered_map<std::filesystem::path, std::unique_ptr<Task>>& tasks() override { return tasks_; }
+        std::unordered_map<std::filesystem::path, std::unique_ptr<Task>>& tasks() { return tasks_; }
 
-        std::vector<std::filesystem::path> includePaths(const std::filesystem::path& sym_links) override {
+        std::vector<std::filesystem::path> includePaths(const std::filesystem::path& sym_links) {
             std::vector<std::filesystem::path> paths;
-            std::apply([&](const auto&... incs) { (paths.push_back(incs.path(sym_links)), ...); }, includes_);
+            for (auto& include : includes_) {
+                paths.push_back(std::visit([&](const auto& inc) { return inc.path(sym_links); }, include));
+            }
             return paths;
         }
 
-        std::string& compiler() override { return *compiler_; }
+        std::string& compiler() { return *compiler_; }
 
-        const std::vector<std::string>& compileFlags() override { return compile_flags_; }
+        const std::vector<std::string>& compileFlags() { return compile_flags_; }
 
-        const std::vector<std::string>& linkFlags() override { return link_flags_; }
+        const std::vector<std::string>& linkFlags() { return link_flags_; }
 
-        std::vector<std::string> linkables() override {
+        std::vector<std::string> linkables() {
             std::vector<std::string> result;
             for (auto& link : links_) {
                 result.push_back(std::visit([](const auto& l) { return l.linkable(); }, link));
@@ -1424,7 +1379,11 @@ class Build {
     private:
         std::filesystem::path                                           build_dir_;
         std::string                                                     default_compiler_;
-        std::vector<__BuildGroupBase*>                                  groups_;
+        // list, not vector: addGroup() returns a BuildGroup& that tasks then store a
+        // pointer into (see Task::group_). A vector would dangle every such pointer the
+        // moment a later addGroup() call triggered a reallocation; list never
+        // reallocates, so those addresses stay stable for the Build's whole lifetime.
+        std::list<BuildGroup>                                           groups_;
         ThreadPool                                                      thread_pool_;
         std::unordered_map<std::filesystem::path, CompileCommandEntry> compile_commands_;
         std::mutex                                                      compile_commands_mutex_;
@@ -1437,17 +1396,12 @@ class Build {
             thread_pool_.setBuild(*this);
         }
 
-        Build(const std::filesystem::path& build_dir, const std::string& compiler, std::initializer_list<__BuildGroupBase*> groups)
-            : Build(build_dir, compiler) {
-            for (__BuildGroupBase* group : groups) {
-                addGroup(group);
-            }
-        }
-
-        void addGroup(__BuildGroupBase* group) {
-            group->setDefaultCompiler(default_compiler_);
-            group->setBuild(*this);
-            groups_.push_back(group);
+        BuildGroup& addGroup() {
+            groups_.emplace_back();
+            BuildGroup& group = groups_.back();
+            group.setDefaultCompiler(default_compiler_);
+            group.setBuild(*this);
+            return group;
         }
 
         const std::filesystem::path& buildDir() const { return build_dir_; }
@@ -1492,15 +1446,15 @@ class Build {
             file << "]";
         }
 
-        void print() const {
+        void print() {
             usize total = 0;
-            for (auto* group : groups_) {
-                total += group->tasks().size();
+            for (auto& group : groups_) {
+                total += group.tasks().size();
             }
             RLOG(LL_DEBUG, "Build: " + std::to_string(total) + " tasks");
 
-            for (auto* group : groups_) {
-                for (auto& [key, task] : group->tasks()) {
+            for (auto& group : groups_) {
+                for (auto& [key, task] : group.tasks()) {
                     task->print();
                 }
             }
@@ -1536,8 +1490,8 @@ class Build {
     private:
         std::forward_list<Task*> collectTasks() {
             std::forward_list<Task*> all;
-            for (auto* group : groups_) {
-                for (auto& [key, task] : group->tasks()) {
+            for (auto& group : groups_) {
+                for (auto& [key, task] : group.tasks()) {
                     all.push_front(task.get());
                 }
             }
@@ -1570,7 +1524,49 @@ class Build {
         }
 };
 
-inline const std::filesystem::path& __BuildGroupBase::buildDir() const { return build_->buildDir(); }
+inline const std::filesystem::path& BuildGroup::buildDir() const { return build_->buildDir(); }
+
+inline bool Task::execute() {
+    std::filesystem::path build_dir = group_->buildDir();
+    std::filesystem::path sym_links = build_dir / "sym_links";
+    CommandOutput result = output_.execute(
+        group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir),
+        group_->compileFlags(), group_->linkFlags(), group_->linkables()
+    );
+    return result.exit_code == 0;
+}
+
+inline std::vector<std::filesystem::path> Task::listDependencies(const std::filesystem::path& build_dir) {
+    std::filesystem::path sym_links = build_dir / "sym_links";
+    return output_.listDependencies(group_->compiler(), group_->includePaths(sym_links), group_->compileFlags());
+}
+
+inline std::optional<CompileCommandEntry> Task::compileCommandEntry() {
+    std::filesystem::path build_dir = group_->buildDir();
+    std::filesystem::path sym_links = build_dir / "sym_links";
+    return output_.compileCommandEntry(group_->compiler(), build_dir, group_->includePaths(sym_links), group_->compileFlags());
+}
+
+inline bool Task::needsRebuild() {
+    if (needs_rebuild_.has_value()) {
+        return *needs_rebuild_;
+    }
+
+    std::filesystem::path build_dir = group_->buildDir();
+    bool                  stale     = output_.isStale(build_dir, collectObjectFiles(build_dir));
+
+    if (!stale) {
+        for (Task* parent : parents_) {
+            if (parent->needsRebuild()) {
+                stale = true;
+                break;
+            }
+        }
+    }
+
+    needs_rebuild_ = stale;
+    return stale;
+}
 
 inline void ThreadPool::workerLoop() {
     while (true) {
