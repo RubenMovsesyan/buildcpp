@@ -1290,14 +1290,7 @@ class ThreadPool {
             }
         }
 
-        ~ThreadPool() {
-            signalDispatchComplete();
-            for (auto& t : threads_) {
-                if (t.joinable()) {
-                    t.join();
-                }
-            }
-        }
+        ~ThreadPool() { waitAll(); }
 
         void pushWork(Task* task) {
             {
@@ -1313,6 +1306,18 @@ class ThreadPool {
                 dispatch_complete_.store(true);
             }
             cv_.notify_all();
+        }
+
+        // Blocks until every already-dispatched task has actually run (not just been
+        // queued) — signals workers there's no more work coming, then joins them.
+        // joinable() guards against the destructor re-joining if this already ran.
+        void waitAll() {
+            signalDispatchComplete();
+            for (auto& t : threads_) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
         }
 };
 
@@ -1380,6 +1385,8 @@ class Build {
                     }
                 }
             }
+
+            thread_pool_.waitAll();
         }
 
     private:
