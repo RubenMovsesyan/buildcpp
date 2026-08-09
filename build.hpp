@@ -569,10 +569,12 @@ inline void __Log_file_impl(const char* path, LogLevel level, const char* file, 
 #include <sys/wait.h>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 struct CommandOutput {
@@ -848,6 +850,132 @@ concept __IsLink = std::same_as<T, __LinkDependency> || std::same_as<T, __LinkPa
     || std::same_as<T, __LinkFramework>
 #endif
     ;
+
+// Only holds a name, not a path: the actual location (<build_dir>/bin/<name>) isn't
+// known until build_dir shows up at execute() time, same as Object's source vs. output
+// path split.
+class Binary {
+    private:
+        std::filesystem::path name_;
+
+    public:
+        Binary(const std::filesystem::path& name) : name_(name) {}
+
+        const std::filesystem::path& name() const { return name_; }
+
+        std::filesystem::path path(const std::filesystem::path& build_dir) const { return build_dir / "bin" / name_; }
+};
+
+enum class Linkage { Shared, Static };
+
+class Library {
+    private:
+        std::filesystem::path name_;
+        Linkage                linkage_;
+
+    public:
+        Library(const std::filesystem::path& name, Linkage linkage) : name_(name), linkage_(linkage) {}
+
+        const std::filesystem::path& name() const { return name_; }
+
+        Linkage linkage() const { return linkage_; }
+
+        std::filesystem::path path(const std::filesystem::path& build_dir) const {
+            std::filesystem::path filename = "lib" + name_.string();
+#if defined(__APPLE__)
+            filename += linkage_ == Linkage::Static ? ".a" : ".dylib";
+#else
+            filename += linkage_ == Linkage::Static ? ".a" : ".so";
+#endif
+            return build_dir / "lib" / filename;
+        }
+};
+
+// Wraps whatever a task ultimately produces. Not slotted into Task yet — this is just
+// the shape: once it is, Task will hold an Output in place of a bare Object, and
+// object_files (this task's transitive parents' compiled outputs) will come from the
+// DAG walk Task already does for LinkTask/LibraryTask today.
+class Output {
+    private:
+        std::variant<Object, Binary, Library> value_;
+
+    public:
+        Output(Object object) : value_(std::move(object)) {}
+        Output(Binary binary) : value_(std::move(binary)) {}
+        Output(Library library) : value_(std::move(library)) {}
+
+        CommandOutput execute(
+            const std::string&                         compiler,
+            const std::filesystem::path&                build_dir,
+            const std::vector<std::filesystem::path>&   include_paths,
+            const std::vector<std::filesystem::path>&   object_files
+        ) {
+            return std::visit(
+                [&](auto& out) -> CommandOutput {
+                    using T = std::decay_t<decltype(out)>;
+
+                    if constexpr (std::same_as<T, Object>) {
+                        return out.compile(compiler, build_dir, include_paths);
+                    } else if constexpr (std::same_as<T, Binary>) {
+                        std::filesystem::path output_path = out.path(build_dir);
+                        std::filesystem::create_directories(output_path.parent_path());
+
+                        Command cmd({compiler});
+                        for (const auto& obj : object_files) {
+                            cmd.push_back(obj.string());
+                        }
+                        cmd.push_back("-o");
+                        cmd.push_back(output_path.string());
+
+                        return cmd.exec();
+                    } else {
+                        std::filesystem::path output_path = out.path(build_dir);
+                        std::filesystem::create_directories(output_path.parent_path());
+
+                        if (out.linkage() == Linkage::Static) {
+                            std::filesystem::remove(output_path);
+
+                            Command cmd({"ar", "rcs", output_path.string()});
+                            for (const auto& obj : object_files) {
+                                cmd.push_back(obj.string());
+                            }
+                            return cmd.exec();
+                        }
+
+                        Command cmd({compiler});
+#if defined(__APPLE__)
+                        cmd.push_back("-dynamiclib");
+#else
+                        cmd.push_back("-shared");
+#endif
+                        for (const auto& obj : object_files) {
+                            cmd.push_back(obj.string());
+                        }
+                        cmd.push_back("-o");
+                        cmd.push_back(output_path.string());
+
+                        return cmd.exec();
+                    }
+                },
+                value_
+            );
+        }
+
+        std::vector<std::filesystem::path> listDependencies(const std::string& compiler, const std::vector<std::filesystem::path>& include_paths) {
+            return std::visit(
+                [&](auto& out) -> std::vector<std::filesystem::path> {
+                    using T = std::decay_t<decltype(out)>;
+
+                    if constexpr (std::same_as<T, Object>) {
+                        return out.listDependencies(compiler, include_paths);
+                    } else {
+                        return {};
+                    }
+                },
+                value_
+            );
+        }
+};
 
 class Task;
 
