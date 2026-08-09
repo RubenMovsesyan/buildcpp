@@ -733,27 +733,33 @@ class Object {
             return path;
         }
 
-        CommandOutput compile(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) {
+        CommandOutput compile(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths, const std::vector<std::string>& compile_flags) {
             RLOG(LL_INFO, "Compiling: " + source_path_.string());
             output_path_ = outputPath(build_dir);
 
             std::filesystem::create_directories(output_path_.parent_path());
 
-            return compileCommand(compiler, build_dir, include_paths).exec();
+            return compileCommand(compiler, build_dir, include_paths, compile_flags).exec();
         }
 
         // What compile() would run, without running it — shared so compile_commands.json
         // generation and the real compile can never drift apart.
-        CompileCommandEntry compileCommandEntry(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) const {
+        CompileCommandEntry compileCommandEntry(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths, const std::vector<std::string>& compile_flags) const {
             return CompileCommandEntry{
                 std::filesystem::current_path(),
-                compileCommand(compiler, build_dir, include_paths).string(),
+                compileCommand(compiler, build_dir, include_paths, compile_flags).string(),
                 std::filesystem::absolute(source_path_),
             };
         }
 
-        std::vector<std::filesystem::path> listDependencies(const std::string& compiler, const std::vector<std::filesystem::path>& include_paths) {
+        // compile_flags are included here too (not just compile()): a -D flag can gate
+        // an #include behind a macro, so dependency discovery run without the same
+        // flags as the real compile could silently diverge from it.
+        std::vector<std::filesystem::path> listDependencies(const std::string& compiler, const std::vector<std::filesystem::path>& include_paths, const std::vector<std::string>& compile_flags) {
             Command cmd({compiler});
+            for (const auto& flag : compile_flags) {
+                cmd.push_back(flag);
+            }
             for (const auto& include_path : include_paths) {
                 cmd.push_back("-I" + include_path.string());
             }
@@ -779,8 +785,11 @@ class Object {
         }
 
     private:
-        Command compileCommand(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) const {
+        Command compileCommand(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths, const std::vector<std::string>& compile_flags) const {
             Command cmd({compiler});
+            for (const auto& flag : compile_flags) {
+                cmd.push_back(flag);
+            }
             for (const auto& include_path : include_paths) {
                 cmd.push_back("-I" + include_path.string());
             }
@@ -887,11 +896,14 @@ class Binary {
 
         std::filesystem::path path(const std::filesystem::path& build_dir) const { return build_dir / "bin" / name_; }
 
-        CommandOutput link(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files) {
+        CommandOutput link(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files, const std::vector<std::string>& link_flags) {
             std::filesystem::path output_path = path(build_dir);
             std::filesystem::create_directories(output_path.parent_path());
 
             Command cmd({compiler});
+            for (const auto& flag : link_flags) {
+                cmd.push_back(flag);
+            }
             for (const auto& obj : object_files) {
                 cmd.push_back(obj.string());
             }
@@ -926,7 +938,9 @@ class Library {
             return build_dir / "lib" / filename;
         }
 
-        CommandOutput link(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files) {
+        // link_flags only apply to the shared-library path — ar (static archiving) has
+        // no notion of compiler/linker flags.
+        CommandOutput link(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files, const std::vector<std::string>& link_flags) {
             std::filesystem::path output_path = path(build_dir);
             std::filesystem::create_directories(output_path.parent_path());
 
@@ -941,6 +955,9 @@ class Library {
             }
 
             Command cmd({compiler});
+            for (const auto& flag : link_flags) {
+                cmd.push_back(flag);
+            }
 #if defined(__APPLE__)
             cmd.push_back("-dynamiclib");
 #else
@@ -969,33 +986,37 @@ class Output {
         Output(Binary binary) : value_(std::move(binary)) {}
         Output(Library library) : value_(std::move(library)) {}
 
+        // Sorts the two flag sets by variant: Object gets compile_flags, Binary/Library
+        // get link_flags — each variant only ever sees the flags meant for it.
         CommandOutput execute(
             const std::string&                         compiler,
             const std::filesystem::path&                build_dir,
             const std::vector<std::filesystem::path>&   include_paths,
-            const std::vector<std::filesystem::path>&   object_files
+            const std::vector<std::filesystem::path>&   object_files,
+            const std::vector<std::string>&              compile_flags,
+            const std::vector<std::string>&              link_flags
         ) {
             return std::visit(
                 [&](auto& out) -> CommandOutput {
                     using T = std::decay_t<decltype(out)>;
 
                     if constexpr (std::same_as<T, Object>) {
-                        return out.compile(compiler, build_dir, include_paths);
+                        return out.compile(compiler, build_dir, include_paths, compile_flags);
                     } else {
-                        return out.link(compiler, build_dir, object_files);
+                        return out.link(compiler, build_dir, object_files, link_flags);
                     }
                 },
                 value_
             );
         }
 
-        std::vector<std::filesystem::path> listDependencies(const std::string& compiler, const std::vector<std::filesystem::path>& include_paths) {
+        std::vector<std::filesystem::path> listDependencies(const std::string& compiler, const std::vector<std::filesystem::path>& include_paths, const std::vector<std::string>& compile_flags) {
             return std::visit(
                 [&](auto& out) -> std::vector<std::filesystem::path> {
                     using T = std::decay_t<decltype(out)>;
 
                     if constexpr (std::same_as<T, Object>) {
-                        return out.listDependencies(compiler, include_paths);
+                        return out.listDependencies(compiler, include_paths, compile_flags);
                     } else {
                         return {};
                     }
@@ -1070,13 +1091,13 @@ class Output {
 
         // Only the Object variant ever produces a compile-commands entry — Binary/Library
         // link steps aren't compilations of a translation unit.
-        std::optional<CompileCommandEntry> compileCommandEntry(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) const {
+        std::optional<CompileCommandEntry> compileCommandEntry(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths, const std::vector<std::string>& compile_flags) const {
             return std::visit(
                 [&](const auto& out) -> std::optional<CompileCommandEntry> {
                     using T = std::decay_t<decltype(out)>;
 
                     if constexpr (std::same_as<T, Object>) {
-                        return out.compileCommandEntry(compiler, build_dir, include_paths);
+                        return out.compileCommandEntry(compiler, build_dir, include_paths, compile_flags);
                     } else {
                         return std::nullopt;
                     }
@@ -1106,6 +1127,8 @@ class __BuildGroupBase {
         virtual std::unordered_map<std::filesystem::path, std::unique_ptr<Task>>& tasks() = 0;
         virtual std::vector<std::filesystem::path> includePaths(const std::filesystem::path& sym_links) = 0;
         virtual std::string& compiler() = 0;
+        virtual const std::vector<std::string>& compileFlags() = 0;
+        virtual const std::vector<std::string>& linkFlags() = 0;
 
         // No-op if the group already has its own compiler (see BuildGroup's two
         // constructors) — only fills in Build's default when one wasn't specified.
@@ -1145,18 +1168,21 @@ class Task {
         void execute() {
             std::filesystem::path build_dir = group_->buildDir();
             std::filesystem::path sym_links = build_dir / "sym_links";
-            output_.execute(group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir));
+            output_.execute(
+                group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir),
+                group_->compileFlags(), group_->linkFlags()
+            );
         }
 
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
             std::filesystem::path sym_links = build_dir / "sym_links";
-            return output_.listDependencies(group_->compiler(), group_->includePaths(sym_links));
+            return output_.listDependencies(group_->compiler(), group_->includePaths(sym_links), group_->compileFlags());
         }
 
         std::optional<CompileCommandEntry> compileCommandEntry() {
             std::filesystem::path build_dir = group_->buildDir();
             std::filesystem::path sym_links = build_dir / "sym_links";
-            return output_.compileCommandEntry(group_->compiler(), build_dir, group_->includePaths(sym_links));
+            return output_.compileCommandEntry(group_->compiler(), build_dir, group_->includePaths(sym_links), group_->compileFlags());
         }
 
         // Memoized: own staleness OR any parent's (recursive). Safe to call from
@@ -1248,6 +1274,8 @@ class BuildGroup : public __BuildGroupBase {
         std::unordered_map<std::filesystem::path, std::unique_ptr<Task>> tasks_;
         std::tuple<Includes...>                                          includes_;
         std::optional<std::string>                                       compiler_;
+        std::vector<std::string>                                         compile_flags_;
+        std::vector<std::string>                                         link_flags_;
 
     public:
         BuildGroup(Includes... includes) : includes_(includes...) {}
@@ -1259,6 +1287,10 @@ class BuildGroup : public __BuildGroupBase {
                 compiler_ = compiler;
             }
         }
+
+        void addCompileFlag(const std::string& flag) { compile_flags_.push_back(flag); }
+
+        void addLinkFlag(const std::string& flag) { link_flags_.push_back(flag); }
 
         Task& addTask(Output output) {
             Task&                  new_task = *(new Task(std::move(output)));
@@ -1290,6 +1322,10 @@ class BuildGroup : public __BuildGroupBase {
         }
 
         std::string& compiler() override { return *compiler_; }
+
+        const std::vector<std::string>& compileFlags() override { return compile_flags_; }
+
+        const std::vector<std::string>& linkFlags() override { return link_flags_; }
 };
 
 class ThreadPool {
