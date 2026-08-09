@@ -913,17 +913,48 @@ class ObjectTask : public TaskBase {
         }
 };
 
+// Only holds a name, not a path: the actual location (<build_dir>/bin/<name>) isn't
+// known until build_dir shows up at execute() time, same as Object's source vs. output
+// path split.
 class __OutputBinary {
     private:
-        std::filesystem::path output_path_;
+        std::filesystem::path name_;
 
     public:
-        __OutputBinary(const std::filesystem::path& output_path) : output_path_(output_path) {}
+        __OutputBinary(const std::filesystem::path& name) : name_(name) {}
 
-        const std::filesystem::path& path() const { return output_path_; }
+        const std::filesystem::path& name() const { return name_; }
+
+        std::filesystem::path path(const std::filesystem::path& build_dir) const { return build_dir / "bin" / name_; }
+};
+
+enum class Linkage { Shared, Static };
+
+class __OutputLibrary {
+    private:
+        std::filesystem::path name_;
+        Linkage                linkage_;
+
+    public:
+        __OutputLibrary(const std::filesystem::path& name, Linkage linkage) : name_(name), linkage_(linkage) {}
+
+        const std::filesystem::path& name() const { return name_; }
+
+        Linkage linkage() const { return linkage_; }
+
+        std::filesystem::path path(const std::filesystem::path& build_dir) const {
+            std::filesystem::path filename = "lib" + name_.string();
+#if defined(__APPLE__)
+            filename += linkage_ == Linkage::Static ? ".a" : ".dylib";
+#else
+            filename += linkage_ == Linkage::Static ? ".a" : ".so";
+#endif
+            return build_dir / "lib" / filename;
+        }
 };
 
 struct Binary {};
+struct Library {};
 
 template <typename Kind>
 struct __OutputTypeOf;
@@ -933,11 +964,16 @@ struct __OutputTypeOf<Binary> {
         using type = __OutputBinary;
 };
 
+template <>
+struct __OutputTypeOf<Library> {
+        using type = __OutputLibrary;
+};
+
 template <typename Kind>
 using Output = typename __OutputTypeOf<Kind>::type;
 
-// execute() is declared only here — its body needs BuildTask::outputPath()/parents(),
-// so it's defined out-of-line once BuildTask is complete, below.
+// execute() on both is declared only here — the body needs BuildTask::outputPath()/
+// parents(), so it's defined out-of-line once BuildTask is complete, below.
 class LinkTask : public TaskBase {
     private:
         __OutputBinary output_;
@@ -945,11 +981,31 @@ class LinkTask : public TaskBase {
     public:
         LinkTask(__OutputBinary output) : output_(std::move(output)) {}
 
-        const std::filesystem::path& sourcePath() const override { return output_.path(); }
+        const std::filesystem::path& sourcePath() const override { return output_.name(); }
 
         std::filesystem::path outputPath(const std::filesystem::path& build_dir) const override {
+            return output_.path(build_dir);
+        }
+
+        std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) override {
             (void)build_dir;
-            return output_.path();
+            return {};
+        }
+
+        void execute(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) override;
+};
+
+class LibraryTask : public TaskBase {
+    private:
+        __OutputLibrary output_;
+
+    public:
+        LibraryTask(__OutputLibrary output) : output_(std::move(output)) {}
+
+        const std::filesystem::path& sourcePath() const override { return output_.name(); }
+
+        std::filesystem::path outputPath(const std::filesystem::path& build_dir) const override {
+            return output_.path(build_dir);
         }
 
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) override {
@@ -971,6 +1027,11 @@ struct __TaskTypeOf<Object> {
 template <>
 struct __TaskTypeOf<__OutputBinary> {
         using type = LinkTask;
+};
+
+template <>
+struct __TaskTypeOf<__OutputLibrary> {
+        using type = LibraryTask;
 };
 
 template <typename Kind>
@@ -1034,7 +1095,9 @@ class BuildTask {
         }
 };
 
-void LinkTask::execute(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) {
+// Shared by LinkTask and LibraryTask: recursively walks parents() to collect every
+// upstream task's compiled output, deduplicated for diamond dependencies.
+static std::vector<std::filesystem::path> __collectObjectFiles(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) {
     std::vector<std::filesystem::path> object_files;
     std::unordered_set<BuildTask*>     visited;
 
@@ -1055,16 +1118,54 @@ void LinkTask::execute(const std::filesystem::path& build_dir, const std::vector
         collect(parent);
     }
 
-    std::filesystem::create_directories(output_.path().parent_path());
+    return object_files;
+}
+
+void LinkTask::execute(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) {
+    std::vector<std::filesystem::path> object_files = __collectObjectFiles(build_dir, parents);
+
+    std::filesystem::path output_path = output_.path(build_dir);
+    std::filesystem::create_directories(output_path.parent_path());
 
     Command cmd({group_->compiler()});
     for (const auto& obj : object_files) {
         cmd.push_back(obj.string());
     }
     cmd.push_back("-o");
-    cmd.push_back(output_.path().string());
+    cmd.push_back(output_path.string());
 
     cmd.exec();
+}
+
+void LibraryTask::execute(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) {
+    std::vector<std::filesystem::path> object_files = __collectObjectFiles(build_dir, parents);
+
+    std::filesystem::path output_path = output_.path(build_dir);
+    std::filesystem::create_directories(output_path.parent_path());
+
+    if (output_.linkage() == Linkage::Static) {
+        std::filesystem::remove(output_path);
+
+        Command cmd({"ar", "rcs", output_path.string()});
+        for (const auto& obj : object_files) {
+            cmd.push_back(obj.string());
+        }
+        cmd.exec();
+    } else {
+        Command cmd({group_->compiler()});
+#if defined(__APPLE__)
+        cmd.push_back("-dynamiclib");
+#else
+        cmd.push_back("-shared");
+#endif
+        for (const auto& obj : object_files) {
+            cmd.push_back(obj.string());
+        }
+        cmd.push_back("-o");
+        cmd.push_back(output_path.string());
+
+        cmd.exec();
+    }
 }
 
 template <__IsInclude... Includes>
