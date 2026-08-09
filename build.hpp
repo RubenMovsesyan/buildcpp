@@ -1386,9 +1386,10 @@ class BuildGroup {
 };
 
 class ThreadPool {
-    private:
-        static constexpr i32 THREAD_COUNT = 4;
+    public:
+        static constexpr i32 DEFAULT_THREAD_COUNT = 4;
 
+    private:
         Build*                    build_ = nullptr;
         std::vector<std::thread> threads_;
         std::queue<Task*>        work_queue_;
@@ -1400,15 +1401,21 @@ class ThreadPool {
         void workerLoop();
 
     public:
-        ThreadPool() : dispatch_complete_(false) {
-            for (i32 i = 0; i < THREAD_COUNT; ++i) {
-                threads_.emplace_back(&ThreadPool::workerLoop, this);
-            }
-        }
+        ThreadPool() : dispatch_complete_(false) {}
 
         ~ThreadPool() { waitAll(); }
 
         void setBuild(Build& build) { build_ = &build; }
+
+        // Threads aren't spawned at construction — ThreadPool is a Build member, built
+        // before Build's own constructor body runs, before -j has even been parsed.
+        // Called explicitly from Build::build(), once the thread count is known and
+        // there's actually a DAG ready to dispatch.
+        void start(i32 thread_count = DEFAULT_THREAD_COUNT) {
+            for (i32 i = 0; i < thread_count; ++i) {
+                threads_.emplace_back(&ThreadPool::workerLoop, this);
+            }
+        }
 
         void pushWork(Task* task) {
             {
@@ -1455,11 +1462,14 @@ class Build {
         // Not atomic: only ever touched from addTask() during single-threaded build
         // setup, before the thread pool has any work to race over.
         usize                                                            command_counter_ = 0;
+        i32                                                              jobs_;
 
     public:
         Build(const std::filesystem::path& build_dir, const std::string& compiler, int argc, char** argv)
             : build_dir_(build_dir), default_compiler_(compiler) {
             selfRebuild(argc, argv);
+
+            jobs_ = parseJobs(argc, argv);
 
             std::filesystem::create_directories(build_dir_);
             thread_pool_.setBuild(*this);
@@ -1536,6 +1546,8 @@ class Build {
             buildDAG();
 	    print();
 
+            thread_pool_.start(jobs_);
+
             std::forward_list<Task*> pending = collectTasks();
 
             while (!pending.empty()) {
@@ -1560,6 +1572,24 @@ class Build {
         }
 
     private:
+        // Dedicated, hardcoded parse — separate from the generic defineArg()/parseArgs()
+        // system, since -j is a build-tool built-in, not something a script opts into.
+        // First occurrence wins; a missing/unparseable value falls back to the default
+        // and logs an error rather than blocking the rest of the build.
+        i32 parseJobs(int argc, char** argv) const {
+            for (int i = 1; i < argc - 1; ++i) {
+                if (std::string(argv[i]) == "-j") {
+                    try {
+                        return static_cast<i32>(std::stoi(argv[i + 1]));
+                    } catch (...) {
+                        RLOG(LL_ERROR, "Invalid value for -j: " + std::string(argv[i + 1]));
+                        return ThreadPool::DEFAULT_THREAD_COUNT;
+                    }
+                }
+            }
+            return ThreadPool::DEFAULT_THREAD_COUNT;
+        }
+
         // Compares this build script's own source (found via __BASE_FILE__ — the
         // actual top-level file passed to the compiler, whatever it's named, not a
         // hardcoded "build.cpp") and build.hpp itself (via __FILE__, the same trick
