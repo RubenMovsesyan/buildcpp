@@ -864,6 +864,20 @@ class Binary {
         const std::filesystem::path& name() const { return name_; }
 
         std::filesystem::path path(const std::filesystem::path& build_dir) const { return build_dir / "bin" / name_; }
+
+        CommandOutput link(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files) {
+            std::filesystem::path output_path = path(build_dir);
+            std::filesystem::create_directories(output_path.parent_path());
+
+            Command cmd({compiler});
+            for (const auto& obj : object_files) {
+                cmd.push_back(obj.string());
+            }
+            cmd.push_back("-o");
+            cmd.push_back(output_path.string());
+
+            return cmd.exec();
+        }
 };
 
 enum class Linkage { Shared, Static };
@@ -888,6 +902,35 @@ class Library {
             filename += linkage_ == Linkage::Static ? ".a" : ".so";
 #endif
             return build_dir / "lib" / filename;
+        }
+
+        CommandOutput link(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files) {
+            std::filesystem::path output_path = path(build_dir);
+            std::filesystem::create_directories(output_path.parent_path());
+
+            if (linkage_ == Linkage::Static) {
+                std::filesystem::remove(output_path);
+
+                Command cmd({"ar", "rcs", output_path.string()});
+                for (const auto& obj : object_files) {
+                    cmd.push_back(obj.string());
+                }
+                return cmd.exec();
+            }
+
+            Command cmd({compiler});
+#if defined(__APPLE__)
+            cmd.push_back("-dynamiclib");
+#else
+            cmd.push_back("-shared");
+#endif
+            for (const auto& obj : object_files) {
+                cmd.push_back(obj.string());
+            }
+            cmd.push_back("-o");
+            cmd.push_back(output_path.string());
+
+            return cmd.exec();
         }
 };
 
@@ -916,45 +959,8 @@ class Output {
 
                     if constexpr (std::same_as<T, Object>) {
                         return out.compile(compiler, build_dir, include_paths);
-                    } else if constexpr (std::same_as<T, Binary>) {
-                        std::filesystem::path output_path = out.path(build_dir);
-                        std::filesystem::create_directories(output_path.parent_path());
-
-                        Command cmd({compiler});
-                        for (const auto& obj : object_files) {
-                            cmd.push_back(obj.string());
-                        }
-                        cmd.push_back("-o");
-                        cmd.push_back(output_path.string());
-
-                        return cmd.exec();
                     } else {
-                        std::filesystem::path output_path = out.path(build_dir);
-                        std::filesystem::create_directories(output_path.parent_path());
-
-                        if (out.linkage() == Linkage::Static) {
-                            std::filesystem::remove(output_path);
-
-                            Command cmd({"ar", "rcs", output_path.string()});
-                            for (const auto& obj : object_files) {
-                                cmd.push_back(obj.string());
-                            }
-                            return cmd.exec();
-                        }
-
-                        Command cmd({compiler});
-#if defined(__APPLE__)
-                        cmd.push_back("-dynamiclib");
-#else
-                        cmd.push_back("-shared");
-#endif
-                        for (const auto& obj : object_files) {
-                            cmd.push_back(obj.string());
-                        }
-                        cmd.push_back("-o");
-                        cmd.push_back(output_path.string());
-
-                        return cmd.exec();
+                        return out.link(compiler, build_dir, object_files);
                     }
                 },
                 value_
