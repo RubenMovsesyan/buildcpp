@@ -711,6 +711,12 @@ using Include = typename __IncludeTypeOf<Kind>::type;
 template <typename T>
 concept __IsInclude = std::same_as<T, __IncludeDirect> || std::same_as<T, __IncludeSymbolic>;
 
+struct CompileCommandEntry {
+        std::filesystem::path directory;
+        std::string           command;
+        std::filesystem::path file;
+};
+
 class Object {
     private:
         std::filesystem::path source_path_;
@@ -733,16 +739,17 @@ class Object {
 
             std::filesystem::create_directories(output_path_.parent_path());
 
-            Command cmd({compiler});
-            for (const auto& include_path : include_paths) {
-                cmd.push_back("-I" + include_path.string());
-            }
-            cmd.push_back("-c");
-            cmd.push_back(source_path_.string());
-            cmd.push_back("-o");
-            cmd.push_back(output_path_.string());
+            return compileCommand(compiler, build_dir, include_paths).exec();
+        }
 
-            return cmd.exec();
+        // What compile() would run, without running it — shared so compile_commands.json
+        // generation and the real compile can never drift apart.
+        CompileCommandEntry compileCommandEntry(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) const {
+            return CompileCommandEntry{
+                std::filesystem::current_path(),
+                compileCommand(compiler, build_dir, include_paths).string(),
+                std::filesystem::absolute(source_path_),
+            };
         }
 
         std::vector<std::filesystem::path> listDependencies(const std::string& compiler, const std::vector<std::filesystem::path>& include_paths) {
@@ -769,6 +776,20 @@ class Object {
             }
 
             return dependencies;
+        }
+
+    private:
+        Command compileCommand(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) const {
+            Command cmd({compiler});
+            for (const auto& include_path : include_paths) {
+                cmd.push_back("-I" + include_path.string());
+            }
+            cmd.push_back("-c");
+            cmd.push_back(source_path_.string());
+            cmd.push_back("-o");
+            cmd.push_back(outputPath(build_dir).string());
+
+            return cmd;
         }
 };
 
@@ -1046,6 +1067,23 @@ class Output {
                 value_
             );
         }
+
+        // Only the Object variant ever produces a compile-commands entry — Binary/Library
+        // link steps aren't compilations of a translation unit.
+        std::optional<CompileCommandEntry> compileCommandEntry(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) const {
+            return std::visit(
+                [&](const auto& out) -> std::optional<CompileCommandEntry> {
+                    using T = std::decay_t<decltype(out)>;
+
+                    if constexpr (std::same_as<T, Object>) {
+                        return out.compileCommandEntry(compiler, build_dir, include_paths);
+                    } else {
+                        return std::nullopt;
+                    }
+                },
+                value_
+            );
+        }
 };
 
 class Task;
@@ -1113,6 +1151,12 @@ class Task {
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
             std::filesystem::path sym_links = build_dir / "sym_links";
             return output_.listDependencies(group_->compiler(), group_->includePaths(sym_links));
+        }
+
+        std::optional<CompileCommandEntry> compileCommandEntry() {
+            std::filesystem::path build_dir = group_->buildDir();
+            std::filesystem::path sym_links = build_dir / "sym_links";
+            return output_.compileCommandEntry(group_->compiler(), build_dir, group_->includePaths(sym_links));
         }
 
         // Memoized: own staleness OR any parent's (recursive). Safe to call from
@@ -1252,36 +1296,15 @@ class ThreadPool {
     private:
         static constexpr i32 THREAD_COUNT = 4;
 
+        Build*                    build_ = nullptr;
         std::vector<std::thread> threads_;
         std::queue<Task*>        work_queue_;
         std::mutex                mutex_;
         std::condition_variable   cv_;
         std::atomic<bool>         dispatch_complete_;
 
-        void workerLoop() {
-            while (true) {
-                Task* task = nullptr;
-
-                {
-                    std::unique_lock<std::mutex> lock(mutex_);
-                    cv_.wait(lock, [this] { return !work_queue_.empty() || dispatch_complete_.load(); });
-
-                    if (!work_queue_.empty()) {
-                        task = work_queue_.front();
-                        work_queue_.pop();
-                    }
-                }
-
-                if (task != nullptr) {
-                    if (task->needsRebuild()) {
-                        task->execute();
-                    }
-                    task->complete();
-                } else if (dispatch_complete_.load()) {
-                    break;
-                }
-            }
-        }
+        // Defined out-of-line, after Build, since the body needs Build::recordCompileCommand.
+        void workerLoop();
 
     public:
         ThreadPool() : dispatch_complete_(false) {
@@ -1291,6 +1314,8 @@ class ThreadPool {
         }
 
         ~ThreadPool() { waitAll(); }
+
+        void setBuild(Build& build) { build_ = &build; }
 
         void pushWork(Task* task) {
             {
@@ -1323,15 +1348,18 @@ class ThreadPool {
 
 class Build {
     private:
-        std::filesystem::path          build_dir_;
-        std::string                    default_compiler_;
-        std::vector<__BuildGroupBase*> groups_;
-        ThreadPool                     thread_pool_;
+        std::filesystem::path                                           build_dir_;
+        std::string                                                     default_compiler_;
+        std::vector<__BuildGroupBase*>                                  groups_;
+        ThreadPool                                                      thread_pool_;
+        std::unordered_map<std::filesystem::path, CompileCommandEntry> compile_commands_;
+        std::mutex                                                      compile_commands_mutex_;
 
     public:
         Build(const std::filesystem::path& build_dir, const std::string& compiler)
             : build_dir_(build_dir), default_compiler_(compiler) {
             std::filesystem::create_directories(build_dir_);
+            thread_pool_.setBuild(*this);
         }
 
         Build(const std::filesystem::path& build_dir, const std::string& compiler, std::initializer_list<__BuildGroupBase*> groups)
@@ -1348,6 +1376,37 @@ class Build {
         }
 
         const std::filesystem::path& buildDir() const { return build_dir_; }
+
+        // Recorded unconditionally by every worker before checking needsRebuild(), so
+        // compile_commands.json stays complete even when most tasks are skipped on an
+        // incremental build.
+        void recordCompileCommand(CompileCommandEntry entry) {
+            std::lock_guard<std::mutex> lock(compile_commands_mutex_);
+            compile_commands_[entry.file] = std::move(entry);
+        }
+
+        void exportCompileCommands(const std::filesystem::path& path = "compile_commands.json") const {
+            std::ofstream file(path);
+            if (!file) {
+                RLOG(LL_ERROR, "Failed to open " + path.string());
+                return;
+            }
+
+            file << "[\n";
+
+            usize i     = 0;
+            usize total = compile_commands_.size();
+            for (const auto& [key, entry] : compile_commands_) {
+                file << "\t{\n";
+                file << "\t\t\"directory\": \"" << entry.directory.string() << "\",\n";
+                file << "\t\t\"command\": \"" << entry.command << "\",\n";
+                file << "\t\t\"file\": \"" << entry.file.string() << "\"\n";
+                file << "\t}";
+                file << (++i < total ? ",\n" : "\n");
+            }
+
+            file << "]";
+        }
 
         void print() const {
             usize total = 0;
@@ -1387,6 +1446,7 @@ class Build {
             }
 
             thread_pool_.waitAll();
+            exportCompileCommands();
         }
 
     private:
@@ -1427,3 +1487,31 @@ class Build {
 };
 
 inline const std::filesystem::path& __BuildGroupBase::buildDir() const { return build_->buildDir(); }
+
+inline void ThreadPool::workerLoop() {
+    while (true) {
+        Task* task = nullptr;
+
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return !work_queue_.empty() || dispatch_complete_.load(); });
+
+            if (!work_queue_.empty()) {
+                task = work_queue_.front();
+                work_queue_.pop();
+            }
+        }
+
+        if (task != nullptr) {
+            if (auto entry = task->compileCommandEntry()) {
+                build_->recordCompileCommand(std::move(*entry));
+            }
+            if (task->needsRebuild()) {
+                task->execute();
+            }
+            task->complete();
+        } else if (dispatch_complete_.load()) {
+            break;
+        }
+    }
+}
