@@ -882,6 +882,12 @@ concept __IsLink = std::same_as<T, __LinkDependency> || std::same_as<T, __LinkPa
 #endif
     ;
 
+#if defined(__APPLE__)
+using __LinkVariant = std::variant<__LinkDependency, __LinkPath, __LinkFramework>;
+#else
+using __LinkVariant = std::variant<__LinkDependency, __LinkPath>;
+#endif
+
 // Only holds a name, not a path: the actual location (<build_dir>/bin/<name>) isn't
 // known until build_dir shows up at execute() time, same as Object's source vs. output
 // path split.
@@ -896,7 +902,12 @@ class Binary {
 
         std::filesystem::path path(const std::filesystem::path& build_dir) const { return build_dir / "bin" / name_; }
 
-        CommandOutput link(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files, const std::vector<std::string>& link_flags) {
+        // linkables (-lfoo/-L.../-framework Foo) go after the object files that need
+        // their symbols, matching normal linker convention.
+        CommandOutput link(
+            const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files,
+            const std::vector<std::string>& link_flags, const std::vector<std::string>& linkables
+        ) {
             std::filesystem::path output_path = path(build_dir);
             std::filesystem::create_directories(output_path.parent_path());
 
@@ -906,6 +917,9 @@ class Binary {
             }
             for (const auto& obj : object_files) {
                 cmd.push_back(obj.string());
+            }
+            for (const auto& linkable : linkables) {
+                cmd.push_back(linkable);
             }
             cmd.push_back("-o");
             cmd.push_back(output_path.string());
@@ -938,9 +952,12 @@ class Library {
             return build_dir / "lib" / filename;
         }
 
-        // link_flags only apply to the shared-library path — ar (static archiving) has
-        // no notion of compiler/linker flags.
-        CommandOutput link(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files, const std::vector<std::string>& link_flags) {
+        // link_flags/linkables only apply to the shared-library path — ar (static
+        // archiving) has no notion of compiler/linker flags or external libraries.
+        CommandOutput link(
+            const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files,
+            const std::vector<std::string>& link_flags, const std::vector<std::string>& linkables
+        ) {
             std::filesystem::path output_path = path(build_dir);
             std::filesystem::create_directories(output_path.parent_path());
 
@@ -966,6 +983,9 @@ class Library {
             for (const auto& obj : object_files) {
                 cmd.push_back(obj.string());
             }
+            for (const auto& linkable : linkables) {
+                cmd.push_back(linkable);
+            }
             cmd.push_back("-o");
             cmd.push_back(output_path.string());
 
@@ -986,15 +1006,17 @@ class Output {
         Output(Binary binary) : value_(std::move(binary)) {}
         Output(Library library) : value_(std::move(library)) {}
 
-        // Sorts the two flag sets by variant: Object gets compile_flags, Binary/Library
-        // get link_flags — each variant only ever sees the flags meant for it.
+        // Sorts by variant: Object gets compile_flags; Binary/Library get link_flags and
+        // linkables (-lfoo/-L.../-framework Foo) — each variant only ever sees what's
+        // meant for it.
         CommandOutput execute(
             const std::string&                         compiler,
             const std::filesystem::path&                build_dir,
             const std::vector<std::filesystem::path>&   include_paths,
             const std::vector<std::filesystem::path>&   object_files,
             const std::vector<std::string>&              compile_flags,
-            const std::vector<std::string>&              link_flags
+            const std::vector<std::string>&              link_flags,
+            const std::vector<std::string>&              linkables
         ) {
             return std::visit(
                 [&](auto& out) -> CommandOutput {
@@ -1003,7 +1025,7 @@ class Output {
                     if constexpr (std::same_as<T, Object>) {
                         return out.compile(compiler, build_dir, include_paths, compile_flags);
                     } else {
-                        return out.link(compiler, build_dir, object_files, link_flags);
+                        return out.link(compiler, build_dir, object_files, link_flags, linkables);
                     }
                 },
                 value_
@@ -1129,6 +1151,7 @@ class __BuildGroupBase {
         virtual std::string& compiler() = 0;
         virtual const std::vector<std::string>& compileFlags() = 0;
         virtual const std::vector<std::string>& linkFlags() = 0;
+        virtual std::vector<std::string> linkables() = 0;
 
         // No-op if the group already has its own compiler (see BuildGroup's two
         // constructors) — only fills in Build's default when one wasn't specified.
@@ -1172,7 +1195,7 @@ class Task {
             std::filesystem::path sym_links = build_dir / "sym_links";
             CommandOutput result = output_.execute(
                 group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir),
-                group_->compileFlags(), group_->linkFlags()
+                group_->compileFlags(), group_->linkFlags(), group_->linkables()
             );
             return result.exit_code == 0;
         }
@@ -1279,6 +1302,7 @@ class BuildGroup : public __BuildGroupBase {
         std::optional<std::string>                                       compiler_;
         std::vector<std::string>                                         compile_flags_;
         std::vector<std::string>                                         link_flags_;
+        std::vector<__LinkVariant>                                       links_;
 
     public:
         BuildGroup(Includes... includes) : includes_(includes...) {}
@@ -1294,6 +1318,9 @@ class BuildGroup : public __BuildGroupBase {
         void addCompileFlag(const std::string& flag) { compile_flags_.push_back(flag); }
 
         void addLinkFlag(const std::string& flag) { link_flags_.push_back(flag); }
+
+        template <__IsLink T>
+        void addLink(T link) { links_.emplace_back(std::move(link)); }
 
         Task& addTask(Output output) {
             Task&                  new_task = *(new Task(std::move(output)));
@@ -1329,6 +1356,14 @@ class BuildGroup : public __BuildGroupBase {
         const std::vector<std::string>& compileFlags() override { return compile_flags_; }
 
         const std::vector<std::string>& linkFlags() override { return link_flags_; }
+
+        std::vector<std::string> linkables() override {
+            std::vector<std::string> result;
+            for (auto& link : links_) {
+                result.push_back(std::visit([](const auto& l) { return l.linkable(); }, link));
+            }
+            return result;
+        }
 };
 
 class ThreadPool {
