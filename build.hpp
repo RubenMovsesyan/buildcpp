@@ -586,7 +586,8 @@ struct CommandOutput {
 
 class Command {
     private:
-        std::vector<std::string> command_chain_;
+        std::vector<std::string>             command_chain_;
+        std::optional<std::filesystem::path> exec_dir_;
 
     public:
         Command() = default;
@@ -594,6 +595,13 @@ class Command {
 
         template <typename T>
         void push_back(T&& arg) { command_chain_.emplace_back(std::forward<T>(arg)); }
+
+        // Unset (default) runs in the current directory, same as before this existed.
+        // Scoped to this one subprocess via a shell "cd X && ..." prefix rather than an
+        // actual chdir() call — chdir() is process-wide, and exec() runs concurrently
+        // across the thread pool's worker threads, so a real chdir() would race across
+        // threads compiling different files.
+        void setExecDir(const std::filesystem::path& dir) { exec_dir_ = dir; }
 
         const std::vector<std::string>& command_chain() const { return command_chain_; }
 
@@ -619,6 +627,9 @@ class Command {
             close(stderr_fd);
 
             std::string command = string() + " 2>" + stderr_template;
+            if (exec_dir_.has_value()) {
+                command = "cd " + exec_dir_->string() + " && " + command;
+            }
 
             FILE* pipe = popen(command.c_str(), "r");
 
