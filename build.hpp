@@ -1190,6 +1190,11 @@ class BuildGroup : public __BuildGroupBase {
             BuildTask&             new_task = *(new BuildTask(task));
             new_task.setGroup(*this);
             std::filesystem::path key = new_task.sourcePath().stem();
+
+            if (tasks_.contains(key)) {
+                RLOG(LL_FATAL, "BuildTask name collision: \"" + key.string() + "\" is already registered in this group — choose a different name");
+            }
+
             tasks_[key] = std::unique_ptr<BuildTask>(&new_task);
             return new_task;
         }
