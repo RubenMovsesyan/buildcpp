@@ -571,6 +571,7 @@ inline void __Log_file_impl(const char* path, LogLevel level, const char* file, 
 #include <tuple>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -718,10 +719,15 @@ class Object {
 
         const std::filesystem::path& sourcePath() const { return source_path_; }
 
+        std::filesystem::path outputPath(const std::filesystem::path& build_dir) const {
+            std::filesystem::path path = build_dir / source_path_;
+            path.replace_extension(".o");
+            return path;
+        }
+
         template <__IsInclude... Includes>
         CommandOutput compile(std::string& compiler, const std::filesystem::path& build_dir, const std::filesystem::path& sym_links, const Includes&... includes) {
-            output_path_ = build_dir / source_path_;
-            output_path_.replace_extension(".o");
+            output_path_ = outputPath(build_dir);
 
             std::filesystem::create_directories(output_path_.parent_path());
 
@@ -854,6 +860,7 @@ class __BuildGroupBase {
         virtual std::unordered_map<std::filesystem::path, std::unique_ptr<BuildTask>>& tasks() = 0;
         virtual std::vector<std::filesystem::path> listDependencies(Object& obj, const std::filesystem::path& sym_links) = 0;
         virtual CommandOutput compile(Object& obj, const std::filesystem::path& build_dir, const std::filesystem::path& sym_links) = 0;
+        virtual std::string& compiler() = 0;
 
         // No-op if the group already has its own compiler (see BuildGroup's two
         // constructors) — only fills in Build's default when one wasn't specified.
@@ -873,8 +880,11 @@ class TaskBase {
 
         void setGroup(__BuildGroupBase& group) { group_ = &group; }
 
-        virtual void execute(const std::filesystem::path& build_dir) = 0;
+        // parents lets a task (e.g. LinkTask) walk what it transitively depends on;
+        // most kinds (e.g. ObjectTask) just ignore it.
+        virtual void execute(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) = 0;
         virtual const std::filesystem::path& sourcePath() const = 0;
+        virtual std::filesystem::path outputPath(const std::filesystem::path& build_dir) const = 0;
         virtual std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) = 0;
 };
 
@@ -887,15 +897,67 @@ class ObjectTask : public TaskBase {
 
         const std::filesystem::path& sourcePath() const override { return object_.sourcePath(); }
 
+        std::filesystem::path outputPath(const std::filesystem::path& build_dir) const override {
+            return object_.outputPath(build_dir);
+        }
+
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) override {
             std::filesystem::path sym_links = build_dir / "sym_links";
             return group_->listDependencies(object_, sym_links);
         }
 
-        void execute(const std::filesystem::path& build_dir) override {
+        void execute(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) override {
+            (void)parents;
             std::filesystem::path sym_links = build_dir / "sym_links";
             group_->compile(object_, build_dir, sym_links);
         }
+};
+
+class __OutputBinary {
+    private:
+        std::filesystem::path output_path_;
+
+    public:
+        __OutputBinary(const std::filesystem::path& output_path) : output_path_(output_path) {}
+
+        const std::filesystem::path& path() const { return output_path_; }
+};
+
+struct Binary {};
+
+template <typename Kind>
+struct __OutputTypeOf;
+
+template <>
+struct __OutputTypeOf<Binary> {
+        using type = __OutputBinary;
+};
+
+template <typename Kind>
+using Output = typename __OutputTypeOf<Kind>::type;
+
+// execute() is declared only here — its body needs BuildTask::outputPath()/parents(),
+// so it's defined out-of-line once BuildTask is complete, below.
+class LinkTask : public TaskBase {
+    private:
+        __OutputBinary output_;
+
+    public:
+        LinkTask(__OutputBinary output) : output_(std::move(output)) {}
+
+        const std::filesystem::path& sourcePath() const override { return output_.path(); }
+
+        std::filesystem::path outputPath(const std::filesystem::path& build_dir) const override {
+            (void)build_dir;
+            return output_.path();
+        }
+
+        std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) override {
+            (void)build_dir;
+            return {};
+        }
+
+        void execute(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) override;
 };
 
 template <typename Kind>
@@ -904,6 +966,11 @@ struct __TaskTypeOf;
 template <>
 struct __TaskTypeOf<Object> {
         using type = ObjectTask;
+};
+
+template <>
+struct __TaskTypeOf<__OutputBinary> {
+        using type = LinkTask;
 };
 
 template <typename Kind>
@@ -933,13 +1000,17 @@ class BuildTask {
 
         void setGroup(__BuildGroupBase& group) { task_->setGroup(group); }
 
-        void execute(const std::filesystem::path& build_dir) { task_->execute(build_dir); }
+        void execute(const std::filesystem::path& build_dir) { task_->execute(build_dir, parents_); }
 
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
             return task_->listDependencies(build_dir);
         }
 
         const std::filesystem::path& sourcePath() const { return task_->sourcePath(); }
+
+        std::filesystem::path outputPath(const std::filesystem::path& build_dir) const { return task_->outputPath(build_dir); }
+
+        const std::vector<BuildTask*>& parents() const { return parents_; }
 
         i32 parentCount() const { return parent_count_.load(); }
 
@@ -962,6 +1033,39 @@ class BuildTask {
             RLOG(LL_DEBUG, oss.str());
         }
 };
+
+void LinkTask::execute(const std::filesystem::path& build_dir, const std::vector<BuildTask*>& parents) {
+    std::vector<std::filesystem::path> object_files;
+    std::unordered_set<BuildTask*>     visited;
+
+    std::function<void(BuildTask*)> collect = [&](BuildTask* task) {
+        if (visited.contains(task)) {
+            return;
+        }
+        visited.insert(task);
+
+        object_files.push_back(task->outputPath(build_dir));
+
+        for (BuildTask* parent : task->parents()) {
+            collect(parent);
+        }
+    };
+
+    for (BuildTask* parent : parents) {
+        collect(parent);
+    }
+
+    std::filesystem::create_directories(output_.path().parent_path());
+
+    Command cmd({group_->compiler()});
+    for (const auto& obj : object_files) {
+        cmd.push_back(obj.string());
+    }
+    cmd.push_back("-o");
+    cmd.push_back(output_.path().string());
+
+    cmd.exec();
+}
 
 template <__IsInclude... Includes>
 class BuildGroup : public __BuildGroupBase {
@@ -1010,6 +1114,8 @@ class BuildGroup : public __BuildGroupBase {
                 [&](const auto&... incs) { return obj.compile(*compiler_, build_dir, sym_links, incs...); }, includes_
             );
         }
+
+        std::string& compiler() override { return *compiler_; }
 };
 
 class ThreadPool {
