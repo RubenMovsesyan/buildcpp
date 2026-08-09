@@ -776,7 +776,6 @@ class Object {
         }
 
         CommandOutput compile(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths, const std::vector<std::string>& compile_flags) {
-            RLOG(LL_INFO, "Compiling: " + source_path_.string());
             output_path_ = outputPath(build_dir);
 
             std::filesystem::create_directories(output_path_.parent_path());
@@ -1067,10 +1066,13 @@ class Output {
                     using T = std::decay_t<decltype(out)>;
 
                     if constexpr (std::same_as<T, Object>) {
+                        RLOG(LL_INFO, "Compiling: " + out.sourcePath().string());
                         return out.compile(compiler, build_dir, include_paths, compile_flags);
                     } else if constexpr (std::same_as<T, Command>) {
+                        RLOG(LL_INFO, "Running command: " + out.string());
                         return out.exec();
                     } else {
+                        RLOG(LL_INFO, "Linking: " + out.path(build_dir).string());
                         return out.link(compiler, build_dir, object_files, link_flags, linkables);
                     }
                 },
