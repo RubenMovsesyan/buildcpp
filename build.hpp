@@ -913,6 +913,7 @@ class BuildTask {
     private:
         TaskBase*                task_;
         std::vector<BuildTask*>  children_;
+        std::vector<BuildTask*>  parents_;
         std::atomic<i32>         parent_count_;
 
     public:
@@ -925,6 +926,7 @@ class BuildTask {
 
         BuildTask& depends_on(BuildTask& dependency) {
             dependency.children_.push_back(this);
+            parents_.push_back(&dependency);
             ++parent_count_;
             return *this;
         }
