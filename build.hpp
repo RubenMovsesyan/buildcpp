@@ -665,6 +665,20 @@ class Command {
             output.exit_code = WEXITSTATUS(result);
             return output;
         }
+
+        // Unlike exec(), doesn't capture output — runs via system(), which inherits
+        // the caller's stdout/stderr and streams it live. For handing off to another
+        // process the user should actually see running (e.g. self-rebuild's re-exec),
+        // not for anything whose output needs to be inspected afterward.
+        i32 run() const {
+            std::string command = string();
+            if (exec_dir_.has_value()) {
+                command = "cd " + exec_dir_->string() + " && " + command;
+            }
+
+            i32 result = system(command.c_str());
+            return WEXITSTATUS(result);
+        }
 };
 
 // Leading __ marks these internal: not meant to be named directly, use Include<Kind>.
@@ -1443,8 +1457,10 @@ class Build {
         usize                                                            command_counter_ = 0;
 
     public:
-        Build(const std::filesystem::path& build_dir, const std::string& compiler)
+        Build(const std::filesystem::path& build_dir, const std::string& compiler, int argc, char** argv)
             : build_dir_(build_dir), default_compiler_(compiler) {
+            selfRebuild(argc, argv);
+
             std::filesystem::create_directories(build_dir_);
             thread_pool_.setBuild(*this);
         }
@@ -1544,6 +1560,51 @@ class Build {
         }
 
     private:
+        // Compares this build script's own source (found via __BASE_FILE__ — the
+        // actual top-level file passed to the compiler, whatever it's named, not a
+        // hardcoded "build.cpp") and build.hpp itself (via __FILE__, the same trick
+        // build.h used) against a fixed "build" binary name. If either is newer, or
+        // "build" doesn't exist yet, recompiles, re-execs "./build" with the original
+        // argv, and exits — so the rest of this (now-stale) process's build script
+        // never runs, and the fresh process runs the whole thing once instead.
+        void selfRebuild(int argc, char** argv) {
+            std::filesystem::path source  = __BASE_FILE__;
+            std::filesystem::path library = __FILE__;
+            std::filesystem::path binary  = "build";
+
+            bool missing = !std::filesystem::exists(binary);
+            bool stale   = missing || std::filesystem::last_write_time(source) > std::filesystem::last_write_time(binary)
+                         || std::filesystem::last_write_time(library) > std::filesystem::last_write_time(binary);
+
+            if (!stale) {
+                return;
+            }
+
+            if (missing) {
+                RLOG(LL_WARN, "No ./" + binary.string() + " binary found in this directory — after this run, invoke ./" + binary.string()
+                                  + " directly instead of recompiling by hand.");
+            }
+
+            RLOG(LL_INFO, "Rebuilding " + binary.string() + "...");
+
+            Command compile_cmd({default_compiler_, "-std=c++23", source.string(), "-o", binary.string()});
+            CommandOutput compile_result = compile_cmd.exec();
+            if (compile_result.exit_code != 0) {
+                RLOG(LL_FATAL, "Failed to rebuild " + binary.string() + ": " + compile_result.stderr_output);
+            }
+
+            Command run_cmd({"./" + binary.string()});
+            for (int i = 1; i < argc; ++i) {
+                run_cmd.push_back(std::string(argv[i]));
+            }
+
+            if (run_cmd.run() != 0) {
+                RLOG(LL_FATAL, "Rebuilt build script failed");
+            }
+
+            std::exit(0);
+        }
+
         std::forward_list<Task*> collectTasks() {
             std::forward_list<Task*> all;
             for (auto& group : groups_) {
