@@ -1454,10 +1454,24 @@ concept __IsArgValue = std::same_as<T, std::string>
 
 using __ArgVariant = std::variant<std::string, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64>;
 
+enum class Os { Unknown, MacOS, Linux, Windows };
+
 class Build {
     private:
         std::filesystem::path                                           build_dir_;
         std::string                                                     default_compiler_;
+        // Purely compile-time information — the #if picks the default at compile time,
+        // no runtime detection needed. Debug/Release is deliberately not mirrored here;
+        // that's the build script's own call, via defineArg()/arg() if wanted.
+#if defined(__linux__)
+        Os                                                               os_ = Os::Linux;
+#elif defined(__APPLE__)
+        Os                                                               os_ = Os::MacOS;
+#elif defined(_WIN32) || defined(_WIN64)
+        Os                                                               os_ = Os::Windows;
+#else
+        Os                                                               os_ = Os::Unknown;
+#endif
         // list, not vector: addGroup() returns a BuildGroup& that tasks then store a
         // pointer into (see Task::group_). A vector would dangle every such pointer the
         // moment a later addGroup() call triggered a reallocation; list never
@@ -1580,6 +1594,8 @@ class Build {
         }
 
         const std::filesystem::path& buildDir() const { return build_dir_; }
+
+        Os os() const { return os_; }
 
         // Not what actually stops the other worker threads — RLOG(LL_FATAL, ...) does
         // that for free by calling exit() the instant any thread hits a failure, which
