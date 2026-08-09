@@ -1,749 +1,1079 @@
 #pragma once
 
+#ifndef COMMON_H
+#define COMMON_H
+
+#include <assert.h>
+#include <stdint.h>
+#include <sys/types.h>
+
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+#if defined(__unix__) || defined(__APPLE__) || defined(__linux__)
+typedef size_t usize;
+#else
+typedef uint64_t usize;
+#endif
+
+typedef int8_t  i8;
+typedef int16_t i16;
+typedef int32_t i32;
+typedef int64_t i64;
+
+#if defined(__unix__) || defined(__APPLE__) || defined(__linux__)
+typedef ssize_t isize;
+#else
+typedef int64_t isize;
+#endif
+
+typedef float  f32;
+typedef double f64;
+
+static_assert(sizeof(f32) == 4, "Size of float must be 32-bits");
+static_assert(sizeof(f64) == 8, "Size of double must be 64-bits");
+
+#define __MAX__(a, b)                                                                                                                                \
+    ({                                                                                                                                               \
+        __typeof__(a) _a = (a);                                                                                                                      \
+        __typeof__(b) _b = (b);                                                                                                                      \
+        _a > _b ? _a : _b;                                                                                                                           \
+    })
+
+#define __MIN__(a, b)                                                                                                                                \
+    ({                                                                                                                                               \
+        __typeof__(a) _a = (a);                                                                                                                      \
+        __typeof__(b) _b = (b);                                                                                                                      \
+        _a < _b ? _a : _b;                                                                                                                           \
+    })
+
+#define __STRINGIFY__(x) #x
+
+// __CUDACC__, not __cplusplus: plain C++ projects must not have to find the CUDA runtime
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+extern cudaStream_t g_compute_stream;
+#endif
+
+#endif // COMMON_H
+
+#define RLOG_IMPLEMENTATION
+
+#ifndef RLOG_H
+#define RLOG_H
+
+#ifdef __cplusplus
 #include <atomic>
-#include <charconv>
+extern "C" {
+#endif
+
+typedef enum {
+    LL_TRACE,
+    LL_DEBUG,
+    LL_INFO,
+    LL_WARN,
+    LL_ERROR,
+    LL_FATAL,
+} LogLevel;
+
+#define __LOG_WHITE "\033[97m"
+#define __LOG_BLUE "\033[94m"
+#define __LOG_GREEN "\033[92m"
+#define __LOG_YELLOW "\033[93m"
+#define __LOG_RED "\033[91m"
+#define __LOG_PINK "\033[35m"
+#define __LOG_RESET "\033[0m"
+
+#define __FATAL_EXIT 404
+
+static LogLevel __global_log_level = LL_INFO;
+static bool     __log_verbose = false;
+
+void initLog(u32 buffer_size);
+void __Log_impl(LogLevel level, const char* file, u32 line, const char* fmt, ...);
+void __Log_file_impl(const char* path, LogLevel level, const char* file, u32 line, const char* fmt, ...);
+
+#ifdef RLOG_IMPLEMENTATION
+
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef __cplusplus
+#define RUNNING_LOAD(x) ((x).load())
+#define RUNNING_STORE(x, v) ((x).store(v))
+#define RUNNING_INIT(x, v) ((x).store(v))
+#else
+#define RUNNING_LOAD(x) (x)
+#define RUNNING_STORE(x, v) ((x) = (v))
+#define RUNNING_INIT(x, v) ((x) = (v))
+#endif
+
+typedef struct {
+    char*           buf;
+    u32             capacity;
+    u32             write_pos;
+    u32             read_pos;
+    u32             data_len;
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    pthread_t       thread;
+#ifdef __cplusplus
+    std::atomic<bool> running;
+#else
+    volatile bool running;
+#endif
+} __RLogState;
+
+#ifndef RLOG_MAX_FILES
+#define RLOG_MAX_FILES 8
+#endif
+
+typedef struct {
+    char  path[256];
+    FILE* fp;
+} __RLogFileEntry;
+
+static __RLogFileEntry __rlog_files[RLOG_MAX_FILES];
+static u32              __rlog_file_count = 0;
+
+static __RLogState __rlog_state;
+
+static void* __rlog_thread_fn(void* arg) {
+    (void)arg;
+    __RLogState* s = &__rlog_state;
+
+    while (true) {
+        pthread_mutex_lock(&s->mutex);
+
+        while (s->data_len == 0 && RUNNING_LOAD(s->running))
+            pthread_cond_wait(&s->cond, &s->mutex);
+
+        while (s->data_len > 0) {
+            if (s->read_pos + 4 > s->capacity) {
+                s->data_len -= s->capacity - s->read_pos;
+                s->read_pos = 0;
+                continue;
+            }
+
+            u32 raw_len;
+            memcpy(&raw_len, s->buf + s->read_pos, 4);
+
+            if (raw_len == UINT32_MAX) {
+                s->data_len -= s->capacity - s->read_pos;
+                s->read_pos = 0;
+                continue;
+            }
+
+            bool is_file = (raw_len >> 31) & 1;
+            u32 len = raw_len & 0x7FFFFFFFu;
+            u32 header_size = 4;
+            FILE* fp = stderr;
+
+            if (is_file) {
+                memcpy(&fp, s->buf + s->read_pos + 4, sizeof(FILE*));
+                header_size = 4 + (u32)sizeof(FILE*);
+            }
+
+            s->data_len -= header_size + len;
+            s->read_pos += header_size;
+            fwrite(s->buf + s->read_pos, 1, len, fp);
+            s->read_pos += len;
+            if (s->read_pos == s->capacity)
+                s->read_pos = 0;
+        }
+
+        bool still_running = RUNNING_LOAD(s->running);
+        pthread_mutex_unlock(&s->mutex);
+
+        if (!still_running)
+            break;
+    }
+
+    return NULL;
+}
+
+static void __rlog_shutdown(void) {
+    __RLogState* s = &__rlog_state;
+    pthread_mutex_lock(&s->mutex);
+    RUNNING_STORE(s->running, false);
+    pthread_cond_signal(&s->cond);
+    pthread_mutex_unlock(&s->mutex);
+    pthread_join(s->thread, NULL);
+    free(s->buf);
+    pthread_mutex_destroy(&s->mutex);
+    pthread_cond_destroy(&s->cond);
+    for (u32 i = 0; i < __rlog_file_count; i++) {
+        if (__rlog_files[i].fp != NULL) {
+            fclose(__rlog_files[i].fp);
+        }
+    }
+}
+
+void initLog(u32 buffer_size) {
+    char* log_verbose = getenv("LOG_VERBOSE");
+    if (log_verbose != nullptr) {
+        __log_verbose = true;
+    }
+
+    char* log_level = getenv("LOG_LEVEL");
+    if (log_level != nullptr) {
+        if (memcmp(log_level, "TRACE", sizeof(char) * 5) == 0) {
+            __global_log_level = LL_TRACE;
+        } else if (memcmp(log_level, "DEBUG", sizeof(char) * 5) == 0) {
+            __global_log_level = LL_DEBUG;
+        } else if (memcmp(log_level, "INFO", sizeof(char) * 4) == 0) {
+            __global_log_level = LL_INFO;
+        } else if (memcmp(log_level, "WARN", sizeof(char) * 4) == 0) {
+            __global_log_level = LL_WARN;
+        } else if (memcmp(log_level, "ERROR", sizeof(char) * 5) == 0) {
+            __global_log_level = LL_ERROR;
+        } else if (memcmp(log_level, "FATAL", sizeof(char) * 5) == 0) {
+            __global_log_level = LL_FATAL;
+        }
+    }
+
+    __RLogState* s = &__rlog_state;
+    s->buf = (char*)malloc(buffer_size);
+    s->capacity = buffer_size;
+    s->write_pos = s->read_pos = s->data_len = 0;
+    pthread_mutex_init(&s->mutex, NULL);
+    pthread_cond_init(&s->cond, NULL);
+    RUNNING_INIT(s->running, true);
+    pthread_create(&s->thread, NULL, __rlog_thread_fn, NULL);
+    atexit(__rlog_shutdown);
+}
+
+// Takes an already-started va_list so the std::string overload below can share this too.
+static void __Log_vimpl(LogLevel level, const char* file, u32 line, const char* fmt, va_list args) {
+    if (level < __global_log_level) {
+        return;
+    }
+
+    char msg[1024];
+    i32  prefix_len;
+
+    if (__log_verbose) {
+        switch (level) {
+            case LL_TRACE:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_WHITE "[TRACE | %s | %d ]: " __LOG_RESET, file, line);
+                break;
+            case LL_DEBUG:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_BLUE "[DEBUG | %s | %d ]: " __LOG_RESET, file, line);
+                break;
+            case LL_INFO:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_GREEN "[INFO | %s | %d ]: " __LOG_RESET, file, line);
+                break;
+            case LL_WARN:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_YELLOW "[WARN | %s | %d ]: " __LOG_RESET, file, line);
+                break;
+            case LL_ERROR:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_RED "[ERROR | %s | %d ]: " __LOG_RESET, file, line);
+                break;
+            case LL_FATAL:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_PINK "[FATAL | %s | %d ]: " __LOG_RESET, file, line);
+                break;
+            default:
+                return;
+        }
+    } else {
+        switch (level) {
+            case LL_TRACE:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_WHITE "[TRACE]: " __LOG_RESET);
+                break;
+            case LL_DEBUG:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_BLUE "[DEBUG]: " __LOG_RESET);
+                break;
+            case LL_INFO:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_GREEN "[INFO]: " __LOG_RESET);
+                break;
+            case LL_WARN:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_YELLOW "[WARN]: " __LOG_RESET);
+                break;
+            case LL_ERROR:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_RED "[ERROR]: " __LOG_RESET);
+                break;
+            case LL_FATAL:
+                prefix_len = snprintf(msg, sizeof(msg), __LOG_PINK "[FATAL]: " __LOG_RESET);
+                break;
+            default:
+                return;
+        }
+    }
+
+    if (prefix_len < 0 || prefix_len >= (i32)sizeof(msg)) {
+        prefix_len = 0;
+    }
+
+    i32 body_len = vsnprintf(msg + prefix_len, sizeof(msg) - (u32)prefix_len, fmt, args);
+
+    if (body_len < 0) {
+        body_len = 0;
+    }
+
+    i32 total = prefix_len + body_len;
+    if (total >= (i32)sizeof(msg) - 1) {
+        total = (i32)sizeof(msg) - 2;
+    }
+    msg[total] = '\n';
+    total += 1;
+
+    u32 msg_len = (u32)total;
+    u32 entry_size = 4 + msg_len;
+
+    __RLogState* s = &__rlog_state;
+    pthread_mutex_lock(&s->mutex);
+
+    u32 space_at_end = s->capacity - s->write_pos;
+
+    if (space_at_end < entry_size) {
+        if (s->data_len + space_at_end + entry_size > s->capacity) {
+            pthread_mutex_unlock(&s->mutex);
+            goto fatal_check;
+        }
+        if (space_at_end >= 4) {
+            u32 sentinel = UINT32_MAX;
+            memcpy(s->buf + s->write_pos, &sentinel, 4);
+        }
+        s->data_len += space_at_end;
+        s->write_pos = 0;
+    }
+
+    if (s->data_len + entry_size > s->capacity) {
+        pthread_mutex_unlock(&s->mutex);
+        goto fatal_check;
+    }
+
+    memcpy(s->buf + s->write_pos, &msg_len, 4);
+    memcpy(s->buf + s->write_pos + 4, msg, msg_len);
+    s->write_pos += entry_size;
+    if (s->write_pos == s->capacity)
+        s->write_pos = 0;
+    s->data_len += entry_size;
+
+    pthread_cond_signal(&s->cond);
+    pthread_mutex_unlock(&s->mutex);
+
+fatal_check:
+    if (level == LL_FATAL) {
+        exit(__FATAL_EXIT);
+    }
+}
+
+void __Log_impl(LogLevel level, const char* file, u32 line, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    __Log_vimpl(level, file, line, fmt, args);
+    va_end(args);
+}
+
+static void __Log_file_vimpl(const char* path, LogLevel level, const char* file, u32 line, const char* fmt, va_list args) {
+    if (level < __global_log_level) {
+        return;
+    }
+
+    char msg[1024];
+    i32  prefix_len;
+
+    if (__log_verbose) {
+        switch (level) {
+            case LL_TRACE:
+                prefix_len = snprintf(msg, sizeof(msg), "[TRACE | %s | %d ]: ", file, line);
+                break;
+            case LL_DEBUG:
+                prefix_len = snprintf(msg, sizeof(msg), "[DEBUG | %s | %d ]: ", file, line);
+                break;
+            case LL_INFO:
+                prefix_len = snprintf(msg, sizeof(msg), "[INFO | %s | %d ]: ", file, line);
+                break;
+            case LL_WARN:
+                prefix_len = snprintf(msg, sizeof(msg), "[WARN | %s | %d ]: ", file, line);
+                break;
+            case LL_ERROR:
+                prefix_len = snprintf(msg, sizeof(msg), "[ERROR | %s | %d ]: ", file, line);
+                break;
+            case LL_FATAL:
+                prefix_len = snprintf(msg, sizeof(msg), "[FATAL | %s | %d ]: ", file, line);
+                break;
+            default:
+                return;
+        }
+    } else {
+        switch (level) {
+            case LL_TRACE:
+                prefix_len = snprintf(msg, sizeof(msg), "[TRACE]: ");
+                break;
+            case LL_DEBUG:
+                prefix_len = snprintf(msg, sizeof(msg), "[DEBUG]: ");
+                break;
+            case LL_INFO:
+                prefix_len = snprintf(msg, sizeof(msg), "[INFO]: ");
+                break;
+            case LL_WARN:
+                prefix_len = snprintf(msg, sizeof(msg), "[WARN]: ");
+                break;
+            case LL_ERROR:
+                prefix_len = snprintf(msg, sizeof(msg), "[ERROR]: ");
+                break;
+            case LL_FATAL:
+                prefix_len = snprintf(msg, sizeof(msg), "[FATAL]: ");
+                break;
+            default:
+                return;
+        }
+    }
+
+    if (prefix_len < 0 || prefix_len >= (i32)sizeof(msg)) {
+        prefix_len = 0;
+    }
+
+    i32 body_len = vsnprintf(msg + prefix_len, sizeof(msg) - (u32)prefix_len, fmt, args);
+
+    if (body_len < 0) {
+        body_len = 0;
+    }
+
+    i32 total = prefix_len + body_len;
+    if (total >= (i32)sizeof(msg) - 1) {
+        total = (i32)sizeof(msg) - 2;
+    }
+    msg[total] = '\n';
+    total += 1;
+
+    u32 msg_len = (u32)total;
+    u32 entry_size = 4 + (u32)sizeof(FILE*) + msg_len;
+
+    __RLogState* s = &__rlog_state;
+    pthread_mutex_lock(&s->mutex);
+
+    // Lazy-open: find or create file entry while holding the mutex
+    FILE* fp = NULL;
+    for (u32 i = 0; i < __rlog_file_count; i++) {
+        if (strncmp(__rlog_files[i].path, path, 255) == 0) {
+            fp = __rlog_files[i].fp;
+            break;
+        }
+    }
+    if (fp == NULL && __rlog_file_count < RLOG_MAX_FILES) {
+        fp = fopen(path, "a");
+        if (fp != NULL) {
+            strncpy(__rlog_files[__rlog_file_count].path, path, 255);
+            __rlog_files[__rlog_file_count].path[255] = '\0';
+            __rlog_files[__rlog_file_count].fp = fp;
+            __rlog_file_count++;
+        }
+    }
+
+    u32 space_at_end = s->capacity - s->write_pos;
+
+    if (fp == NULL) {
+        pthread_mutex_unlock(&s->mutex);
+        goto fatal_check;
+    }
+
+    if (space_at_end < entry_size) {
+        if (s->data_len + space_at_end + entry_size > s->capacity) {
+            pthread_mutex_unlock(&s->mutex);
+            goto fatal_check;
+        }
+        if (space_at_end >= 4) {
+            u32 sentinel = UINT32_MAX;
+            memcpy(s->buf + s->write_pos, &sentinel, 4);
+        }
+        s->data_len += space_at_end;
+        s->write_pos = 0;
+    }
+
+    if (s->data_len + entry_size > s->capacity) {
+        pthread_mutex_unlock(&s->mutex);
+        goto fatal_check;
+    }
+
+    {
+        u32 raw_len = msg_len | (1u << 31);
+        memcpy(s->buf + s->write_pos, &raw_len, 4);
+        memcpy(s->buf + s->write_pos + 4, &fp, sizeof(FILE*));
+        memcpy(s->buf + s->write_pos + 4 + sizeof(FILE*), msg, msg_len);
+        s->write_pos += entry_size;
+        if (s->write_pos == s->capacity)
+            s->write_pos = 0;
+        s->data_len += entry_size;
+    }
+
+    pthread_cond_signal(&s->cond);
+    pthread_mutex_unlock(&s->mutex);
+
+fatal_check:
+    if (level == LL_FATAL) {
+        exit(__FATAL_EXIT);
+    }
+}
+
+void __Log_file_impl(const char* path, LogLevel level, const char* file, u32 line, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    __Log_file_vimpl(path, level, file, line, fmt, args);
+    va_end(args);
+}
+
+#endif // RLOG_IMPLEMENTATION
+
+#define RLOG(level, fmt, ...) __Log_impl(level, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define RLOG_FILE(path, level, fmt, ...) __Log_file_impl(path, level, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+
+#ifdef __cplusplus
+}
+
+// std::string overload of fmt, C++ only. Plain "..." variadic, not a template — mixed
+// with the char* version's "...", overload resolution can't pick a winner per-argument.
+// fmt is by value, not const&: va_start's last named param can't be a reference type.
+#include <string>
+
+inline void __Log_impl(LogLevel level, const char* file, u32 line, std::string fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    __Log_vimpl(level, file, line, fmt.c_str(), args);
+    va_end(args);
+}
+
+inline void __Log_file_impl(const char* path, LogLevel level, const char* file, u32 line, std::string fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    __Log_file_vimpl(path, level, file, line, fmt.c_str(), args);
+    va_end(args);
+}
+#endif
+
+#endif // RLOG_H
+
+#include <atomic>
+#include <concepts>
 #include <cstdio>
-#include <deque>
+#include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
+#include <forward_list>
 #include <fstream>
 #include <initializer_list>
+#include <memory>
 #include <mutex>
-#include <optional>
-#include <print>
 #include <queue>
 #include <sstream>
+#include <string>
 #include <sys/wait.h>
-#include <system_error>
 #include <thread>
+#include <tuple>
+#include <unistd.h>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
-constexpr const char* DEFAULT_COMPILER = "clang++";
+struct CommandOutput {
+        i32         exit_code;
+        std::string stdout_output;
+        std::string stderr_output;
+};
 
 class Command {
     private:
         std::vector<std::string> command_chain_;
-        std::filesystem::path execution_directory_;
 
     public:
-        Command(std::initializer_list<std::string> command_chain)
-            : command_chain_(command_chain),
-              execution_directory_(std::filesystem::current_path()) {}
+        Command() = default;
+        Command(std::initializer_list<std::string> command_chain) : command_chain_(command_chain) {}
 
-        Command(std::initializer_list<std::string> command_chain, std::filesystem::path exec_dir)
-            : command_chain_(command_chain), execution_directory_(exec_dir) {}
+        template <typename T>
+        void push_back(T&& arg) { command_chain_.emplace_back(std::forward<T>(arg)); }
 
-        Command(const Command& other)
-            : command_chain_(other.command_chain_),
-              execution_directory_(other.execution_directory_) {}
+        const std::vector<std::string>& command_chain() const { return command_chain_; }
 
-        Command& operator=(const Command& other) {
-            if (this != &other) {
-                command_chain_ = other.command_chain_;
-                execution_directory_ = other.execution_directory_;
-            }
+        std::string string() const {
+            std::string result;
 
-            return *this;
-        }
-
-        Command() : execution_directory_(std::filesystem::current_path()) {}
-
-        ~Command() {}
-
-        const std::vector<std::string>& command_chain() const {
-            return command_chain_;
-        }
-
-        void push_back(std::string& chain) { command_chain_.push_back(chain); }
-
-        void push_back(std::string&& chain) { command_chain_.push_back(chain); }
-
-        void print() {
-            for (const auto& chain : command_chain_) {
-                std::print("{} ", chain);
-            }
-
-            std::println("");
-        }
-
-        inline std::string string() {
-            std::string command = "";
-
-            for (size_t i = 0; i < command_chain_.size(); ++i) {
+            for (usize i = 0; i < command_chain_.size(); ++i) {
                 if (i > 0) {
-                    command += " ";
+                    result += " ";
                 }
 
-                command += command_chain_[i];
+                result += command_chain_[i];
             }
 
-            return command;
-        }
-
-        int exec() {
-            std::filesystem::path original_dir = std::filesystem::current_path();
-            std::filesystem::current_path(execution_directory_);
-
-            std::string command = string();
-
-            int result = system(command.c_str());
-
-            std::filesystem::current_path(original_dir);
-
-            return WEXITSTATUS(result);
-        }
-
-        std::string exec_and_capture() {
-            std::filesystem::path original_dir = std::filesystem::current_path();
-            std::filesystem::current_path(execution_directory_);
-
-            std::string command = string();
-
-            command += " 2>&1"; // Redirect to stdout
-
-            FILE* pipe = popen(command.c_str(), "r");
-            if (!pipe) {
-                std::filesystem::current_path(original_dir);
-                return "";
-            }
-
-            std::string result;
-            char buffer[128];
-            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                result += buffer;
-            }
-
-            pclose(pipe);
-            std::filesystem::current_path(original_dir);
             return result;
         }
-};
 
-class CompileCommand {
-    private:
-        Command cmd_;
-        std::filesystem::path directory_;
-        std::filesystem::path file_;
+        CommandOutput exec() const {
+            std::filesystem::path stderr_path = std::filesystem::temp_directory_path() / "buildcpp_stderr_XXXXXX";
+            std::string           stderr_template = stderr_path.string();
 
-    public:
-        // Copy command to be able to use it later
-        CompileCommand(Command cmd, std::filesystem::path file)
-            : directory_(std::filesystem::current_path()), cmd_(cmd), file_(file) {}
-        ~CompileCommand() {}
+            i32 stderr_fd = mkstemp(stderr_template.data());
+            close(stderr_fd);
 
-        void add_to_file(std::ofstream& file) {
-            file << "\t{\n";
+            std::string command = string() + " 2>" + stderr_template;
 
-            file << "\t\t\"directory\": \"" << directory_.string() << "\",\n";
-            file << "\t\t\"command\": \"" << cmd_.string() << "\",\n";
-            file << "\t\t\"file\": \"" << file_.string() << "\"\n";
+            FILE* pipe = popen(command.c_str(), "r");
 
-            file << "\t}" /* << (i < (compile_commands.size() - 1) ? ",\n" : "\n") */;
+            CommandOutput output;
+            char          buffer[256];
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                output.stdout_output += buffer;
+            }
+
+            i32 result = pclose(pipe);
+
+            std::ifstream     stderr_file(stderr_template);
+            std::stringstream stderr_stream;
+            stderr_stream << stderr_file.rdbuf();
+            output.stderr_output = stderr_stream.str();
+
+            std::filesystem::remove(stderr_template);
+
+            output.exit_code = WEXITSTATUS(result);
+            return output;
         }
 };
 
-class Include {
+// Leading __ marks these internal: not meant to be named directly, use Include<Kind>.
+template <typename Derived>
+class __IncludeBase {
     protected:
         std::filesystem::path include_path_;
 
     public:
-        Include(const std::string& path) : include_path_(path) {}
-        ~Include() {}
+        __IncludeBase(const std::filesystem::path& include_path) : include_path_(include_path) {}
 
-        virtual std::string path(std::filesystem::path& sym_links) {
-            return std::filesystem::relative(include_path_, std::filesystem::current_path())
-                .string();
+        // sym_links is unused on the Direct side, kept for a uniform signature.
+        std::filesystem::path path(const std::filesystem::path& sym_links) const;
+};
+
+class __IncludeDirect : public __IncludeBase<__IncludeDirect> {
+    public:
+        using __IncludeBase::__IncludeBase;
+
+        // Hides __IncludeBase::path rather than specializing it: the base can't reach
+        // symbolic_dir_ on the Symbolic side.
+        std::filesystem::path path(const std::filesystem::path& sym_links) const {
+            (void)sym_links;
+            return std::filesystem::relative(include_path_, std::filesystem::current_path());
         }
 };
 
-class SymbolicInclude : public Include {
-    protected:
-        std::string symbolic_dir_;
+class __IncludeSymbolic : public __IncludeBase<__IncludeSymbolic> {
+    private:
+        std::filesystem::path symbolic_dir_;
 
     public:
-        SymbolicInclude(const std::string& path, const std::string& symbolic_dir)
-            : Include(path), symbolic_dir_(symbolic_dir) {}
+        __IncludeSymbolic(const std::filesystem::path& include_path, const std::filesystem::path& symbolic_dir)
+            : __IncludeBase(include_path), symbolic_dir_(symbolic_dir) {}
 
-        virtual std::string path(std::filesystem::path& sym_links) override {
-            Command cmd({
-                "ln",
-                "-sfn",
-                std::filesystem::absolute(include_path_).string(),
-                sym_links.string() + std::string("/") + symbolic_dir_,
-            });
+        std::filesystem::path path(const std::filesystem::path& sym_links) const {
+            std::filesystem::path symlink_path = sym_links / symbolic_dir_;
 
-            cmd.print();
-            cmd.exec();
+            // symlink_status, not exists(): exists() follows the link and misreports a
+            // dangling symlink as absent, which would make create_directory_symlink throw.
+            if (!std::filesystem::exists(std::filesystem::symlink_status(symlink_path))) {
+                std::filesystem::create_directories(symlink_path.parent_path());
+                std::filesystem::create_directory_symlink(std::filesystem::absolute(include_path_), symlink_path);
+            }
 
-            std::filesystem::path sym_path = sym_links;
-
-            return std::filesystem::relative(sym_path, std::filesystem::current_path())
-                .string();
+            return symlink_path;
         }
 };
+
+// No default Kind: Include<Direct>/Include<Symbolic> must always be spelled out.
+struct Direct {};
+struct Symbolic {};
+
+template <typename Kind>
+struct __IncludeTypeOf;
+
+template <>
+struct __IncludeTypeOf<Direct> {
+        using type = __IncludeDirect;
+};
+
+template <>
+struct __IncludeTypeOf<Symbolic> {
+        using type = __IncludeSymbolic;
+};
+
+template <typename Kind>
+using Include = typename __IncludeTypeOf<Kind>::type;
+
+template <typename T>
+concept __IsInclude = std::same_as<T, __IncludeDirect> || std::same_as<T, __IncludeSymbolic>;
 
 class Object {
     private:
         std::filesystem::path source_path_;
-        std::string file_name_;
-        std::string file_name_not_ext_;
-
-        // Helper functions
-        std::vector<std::string> split(const std::string& str) {
-            std::vector<std::string> tokens;
-            std::istringstream ss(str);
-            std::string token;
-
-            while (ss >> token) {
-                tokens.push_back(token);
-            }
-
-            return tokens;
-        }
+        std::filesystem::path output_path_;
 
     public:
-        Object(const std::string& path) : source_path_(path) {
-            file_name_ = source_path_.filename();
-            file_name_not_ext_ = file_name_.substr(0, file_name_.find_last_of("."));
+        Object(const std::filesystem::path& source_path) : source_path_(source_path) {}
+
+        const std::filesystem::path& sourcePath() const { return source_path_; }
+
+        template <__IsInclude... Includes>
+        CommandOutput compile(std::string& compiler, const std::filesystem::path& build_dir, const std::filesystem::path& sym_links, const Includes&... includes) {
+            output_path_ = build_dir / source_path_;
+            output_path_.replace_extension(".o");
+
+            std::filesystem::create_directories(output_path_.parent_path());
+
+            Command cmd({compiler});
+            (cmd.push_back("-I" + includes.path(sym_links).string()), ...);
+            cmd.push_back("-c");
+            cmd.push_back(source_path_.string());
+            cmd.push_back("-o");
+            cmd.push_back(output_path_.string());
+
+            return cmd.exec();
         }
 
-        ~Object() {}
+        template <__IsInclude... Includes>
+        std::vector<std::filesystem::path> listDependencies(std::string& compiler, const std::filesystem::path& sym_links, const Includes&... includes) {
+            Command cmd({compiler});
+            (cmd.push_back("-I" + includes.path(sym_links).string()), ...);
+            cmd.push_back("-MM");
+            cmd.push_back(source_path_.string());
 
-        std::string path() const { return source_path_.string(); }
+            CommandOutput out = cmd.exec();
 
-        std::pair<std::string, std::vector<std::string>>
-        list_all_dependencies(std::string& compiler, std::string& flags, std::string& includes) {
-            Command cmd({compiler, flags, includes, "-MM", source_path_.string()});
-            std::string output = cmd.exec_and_capture();
-            output.erase(std::remove_if(output.begin(), output.end(), [](char c) { return c == '\\' || c == '\n'; }), output.end());
+            std::string deps_output = out.stdout_output;
+            std::erase_if(deps_output, [](char c) { return c == '\\' || c == '\n'; });
 
-            std::string object_file = output.substr(0, output.find_first_of(":"));
-            std::string rest = output.substr(output.find_first_of(":") + 1);
-            std::vector<std::string> dependencies = split(rest);
+            usize colon = deps_output.find(':');
+            std::string deps_list = colon != std::string::npos ? deps_output.substr(colon + 1) : "";
 
-            return {object_file, dependencies};
-        }
-
-        std::array<std::string, 4> build_command(std::filesystem::path& build_dir) {
-            std::filesystem::path relative_path = std::filesystem::relative(
-                source_path_, std::filesystem::current_path()
-            );
-            auto path_parts = relative_path;
-            auto iter = path_parts.begin();
-            if (iter != path_parts.end()) {
-                ++iter; // Skip the first directory
+            std::vector<std::filesystem::path> dependencies;
+            std::istringstream               iss(deps_list);
+            std::string                      token;
+            while (iss >> token) {
+                dependencies.push_back(token);
             }
 
-            std::filesystem::path new_path = build_dir;
-            for (auto it = iter; it != path_parts.end(); ++it) {
-                new_path /= *it;
-            }
-
-            std::filesystem::create_directories(new_path.parent_path());
-            new_path.replace_filename(file_name_not_ext_.append(".o"));
-
-            return {"-c", relative_path.string(), "-o", new_path.string()};
-        }
-
-        void compile(std::string& compiler, std::string& flags, std::string& includes, std::filesystem::path& build_dir, std::vector<std::string>& object_files, std::mutex& object_files_mutex, std::vector<CompileCommand>& compile_commands, std::mutex& compile_commands_mutex) {
-            std::pair<std::string, std::vector<std::string>> self_and_deps =
-                list_all_dependencies(compiler, flags, includes);
-
-            std::vector<std::filesystem::path> deps_paths;
-            for (const auto& dep : self_and_deps.second) {
-                deps_paths.push_back(std::filesystem::current_path() / dep);
-            }
-
-            auto build_commands = build_command(build_dir);
-
-            // Get the last modification time of the object file
-            // std::filesystem::path object_path = build_dir / self_and_deps.first;
-            std::filesystem::path object_path = build_commands[3];
-
-            Command cmd({compiler, flags, includes});
-            for (auto& command_arg : build_commands) {
-                cmd.push_back(command_arg);
-            }
-
-            compile_commands_mutex.lock();
-            compile_commands.emplace_back(cmd, path());
-            compile_commands_mutex.unlock();
-
-            bool needs_rebuild = true;
-            if (std::filesystem::exists(object_path)) {
-                auto object_time = std::filesystem::last_write_time(object_path);
-                needs_rebuild = false;
-
-                for (const auto& dep_path : deps_paths) {
-                    if (std::filesystem::exists(dep_path)) {
-                        // Add a second buffer in case the file was saved right away
-                        auto dep_time = std::filesystem::last_write_time(dep_path) + std::chrono::seconds(1);
-                        if (dep_time > object_time) {
-                            needs_rebuild = true;
-                            break;
-                        }
-                    } else {
-                        needs_rebuild = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!needs_rebuild) {
-                object_files_mutex.lock();
-                object_files.push_back(std::filesystem::relative(object_path).string());
-                object_files_mutex.unlock();
-                return;
-            }
-
-            object_files_mutex.lock();
-            object_files.emplace_back(cmd.command_chain().back());
-            object_files_mutex.unlock();
-
-            cmd.print();
-            int ret_code = cmd.exec();
-            if (ret_code != 0) {
-                std::println("Object file build failed");
-                exit(1);
-            }
+            return dependencies;
         }
 };
 
-class Link {
+template <typename Derived>
+class __LinkBase {
     protected:
         std::string dep_name_;
 
     public:
-        Link(const std::string& dep_name) : dep_name_(dep_name) {}
-        ~Link() {}
+        __LinkBase(const std::string& dep_name) : dep_name_(dep_name) {}
 
-        virtual std::string linkable() { return std::string("-l") + dep_name_; }
+        std::string linkable() const;
 };
 
-class PathLink : public Link {
+class __LinkDependency : public __LinkBase<__LinkDependency> {
+    public:
+        using __LinkBase::__LinkBase;
+
+        std::string linkable() const {
+            return "-l" + dep_name_;
+        }
+};
+
+class __LinkPath : public __LinkBase<__LinkPath> {
     private:
-        std::string dir_name_;
-        std::optional<std::filesystem::path> direct_path_;
+        std::filesystem::path directory_;
 
     public:
-        PathLink(const std::string& dep_name, const std::string& dir_name)
-            : Link(dep_name), dir_name_(dir_name), direct_path_(std::nullopt) {}
-        PathLink(const std::filesystem::path path)
-            : Link(""), dir_name_(), direct_path_(path) {}
+        __LinkPath(const std::string& dep_name, const std::filesystem::path& directory)
+            : __LinkBase(dep_name), directory_(directory) {}
 
-        std::string linkable() override {
-            if (direct_path_) {
-                return (*direct_path_).string();
-            }
-
-            return std::string("-L") + dir_name_ + std::string(" -l") + dep_name_;
+        std::string linkable() const {
+            return "-L" + directory_.string() + " -l" + dep_name_;
         }
 };
 
-// MacOs only
-class Framework : public Link {
-    public:
-        Framework(const std::string& dep_name) : Link(dep_name) {}
-
-        std::string linkable() override {
 #if defined(__APPLE__)
-            return std::string("-framework ") + dep_name_;
-#else
-            return "";
+class __LinkFramework : public __LinkBase<__LinkFramework> {
+    public:
+        using __LinkBase::__LinkBase;
+
+        std::string linkable() const {
+            return "-framework " + dep_name_;
+        }
+};
 #endif
+
+struct Dependency {};
+struct Path {};
+#if defined(__APPLE__)
+struct Framework {};
+#endif
+
+template <typename Kind>
+struct __LinkTypeOf;
+
+template <>
+struct __LinkTypeOf<Dependency> {
+        using type = __LinkDependency;
+};
+
+template <>
+struct __LinkTypeOf<Path> {
+        using type = __LinkPath;
+};
+
+#if defined(__APPLE__)
+template <>
+struct __LinkTypeOf<Framework> {
+        using type = __LinkFramework;
+};
+#endif
+
+template <typename Kind>
+using Link = typename __LinkTypeOf<Kind>::type;
+
+template <typename T>
+concept __IsLink = std::same_as<T, __LinkDependency> || std::same_as<T, __LinkPath>
+#if defined(__APPLE__)
+    || std::same_as<T, __LinkFramework>
+#endif
+    ;
+
+class BuildTask {
+    private:
+        Object                  task_;
+        std::vector<BuildTask*> children_;
+        std::atomic<i32>        parent_count_;
+
+    public:
+        BuildTask(Object task) : task_(std::move(task)), parent_count_(0) {}
+
+        // Heap-allocated, not by value: std::atomic member blocks move/copy, and
+        // children_ pointers need a fixed address anyway.
+        static BuildTask& create(Object task) {
+            return *(new BuildTask(std::move(task)));
+        }
+
+        BuildTask& depends_on(BuildTask& dependency) {
+            dependency.children_.push_back(this);
+            ++parent_count_;
+            return *this;
+        }
+
+        Object& object() { return task_; }
+
+        const std::filesystem::path& sourcePath() const { return task_.sourcePath(); }
+
+        i32 parentCount() const { return parent_count_.load(); }
+
+        void complete() {
+            for (BuildTask* child : children_) {
+                if (child->parent_count_.load() != 0) {
+                    --child->parent_count_;
+                }
+            }
+        }
+
+        void print() const {
+            std::ostringstream oss;
+            oss << "BuildTask " << sourcePath().filename().string() << ": parents=" << parent_count_.load() << ", children=[";
+            for (usize i = 0; i < children_.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << children_[i]->sourcePath().filename().string();
+            }
+            oss << "]";
+            RLOG(LL_DEBUG, oss.str());
         }
 };
 
-enum class Os { Invalid,
-                MacOS,
-                Linux,
-                Windows };
+class __BuildGroupBase {
+    public:
+        virtual ~__BuildGroupBase() = default;
 
-enum class Mode { Release,
-                  Debug };
+        virtual std::unordered_map<std::filesystem::path, std::unique_ptr<BuildTask>>& tasks() = 0;
+        virtual std::vector<std::filesystem::path> listDependencies(Object& obj, std::string& compiler, const std::filesystem::path& sym_links) = 0;
+};
 
-struct Builtin {
-        Os os;
-        Mode mode;
+template <__IsInclude... Includes>
+class BuildGroup : public __BuildGroupBase {
+    private:
+        std::unordered_map<std::filesystem::path, std::unique_ptr<BuildTask>> tasks_;
+        std::tuple<Includes...>                                               includes_;
+
+    public:
+        BuildGroup(Includes... includes) : includes_(includes...) {}
+
+        BuildTask& addTask(BuildTask& task) {
+            std::filesystem::path key = task.object().sourcePath().stem();
+            tasks_[key] = std::unique_ptr<BuildTask>(&task);
+            return task;
+        }
+
+        std::unordered_map<std::filesystem::path, std::unique_ptr<BuildTask>>& tasks() override { return tasks_; }
+
+        std::vector<std::filesystem::path> listDependencies(Object& obj, std::string& compiler, const std::filesystem::path& sym_links) override {
+            return std::apply(
+                [&](const auto&... incs) { return obj.listDependencies(compiler, sym_links, incs...); }, includes_
+            );
+        }
+};
+
+class ThreadPool {
+    private:
+        static constexpr i32 THREAD_COUNT = 4;
+
+        std::vector<std::thread> threads_;
+        std::queue<BuildTask*>   work_queue_;
+        std::mutex                mutex_;
+        std::condition_variable   cv_;
+        std::atomic<bool>         dispatch_complete_;
+
+        void workerLoop() {
+            while (true) {
+                BuildTask* task = nullptr;
+
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    cv_.wait(lock, [this] { return !work_queue_.empty() || dispatch_complete_.load(); });
+
+                    if (!work_queue_.empty()) {
+                        task = work_queue_.front();
+                        work_queue_.pop();
+                    }
+                }
+
+                if (task != nullptr) {
+                    task->complete();
+                } else if (dispatch_complete_.load()) {
+                    break;
+                }
+            }
+        }
+
+    public:
+        ThreadPool() : dispatch_complete_(false) {
+            for (i32 i = 0; i < THREAD_COUNT; ++i) {
+                threads_.emplace_back(&ThreadPool::workerLoop, this);
+            }
+        }
+
+        ~ThreadPool() {
+            signalDispatchComplete();
+            for (auto& t : threads_) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+        }
+
+        void pushWork(BuildTask* task) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                work_queue_.push(task);
+            }
+            cv_.notify_one();
+        }
+
+        void signalDispatchComplete() {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                dispatch_complete_.store(true);
+            }
+            cv_.notify_all();
+        }
 };
 
 class Build {
+    private:
+        std::filesystem::path          build_dir_;
+        std::vector<__BuildGroupBase*> groups_;
+        ThreadPool                     thread_pool_;
+
     public:
-        // Builtin system variables
-        Builtin builtin;
+        Build(const std::filesystem::path& build_dir) : build_dir_(build_dir) {
+            std::filesystem::create_directories(build_dir_);
+        }
+
+        Build(const std::filesystem::path& build_dir, std::initializer_list<__BuildGroupBase*> groups) : Build(build_dir) {
+            groups_ = groups;
+        }
+
+        void addGroup(__BuildGroupBase* group) {
+            groups_.push_back(group);
+        }
+
+        void print() const {
+            usize total = 0;
+            for (auto* group : groups_) {
+                total += group->tasks().size();
+            }
+            RLOG(LL_DEBUG, "Build: " + std::to_string(total) + " tasks");
+
+            for (auto* group : groups_) {
+                for (auto& [key, task] : group->tasks()) {
+                    task->print();
+                }
+            }
+        }
+
+        void build(std::string& compiler, const std::filesystem::path& sym_links) {
+            buildDAG(compiler, sym_links);
+
+            std::forward_list<BuildTask*> pending = collectTasks();
+
+            while (!pending.empty()) {
+                auto prev = pending.before_begin();
+                auto it   = pending.begin();
+
+                while (it != pending.end()) {
+                    BuildTask* task = *it;
+
+                    if (task->parentCount() == 0) {
+                        thread_pool_.pushWork(task);
+                        it = pending.erase_after(prev);
+                    } else {
+                        prev = it;
+                        ++it;
+                    }
+                }
+            }
+        }
 
     private:
-        // This is where the project will build
-        std::filesystem::path build_dir_;
-        // This is where any symbolic includes will go
-        std::filesystem::path sym_link_dir_;
-
-        std::string compiler_;
-
-        struct BuildStep {
-                // Commands that get run before the compilation of the build step
-                std::vector<Command*> pre_step_commands;
-                // These are all the include directories (symbolic and non-symbolic)
-                std::vector<Include*> includes;
-                // These are all the object files to compile into the build
-                std::vector<Object*> objects;
-                // These are all the libraries to link to
-                std::vector<Link*> links;
-                // Flags to use during compilation
-                std::vector<std::string> compilation_flags;
-                // Flags to use during linking
-                std::vector<std::string> linking_flags;
-        };
-
-        std::vector<BuildStep> build_steps_;
-
-        struct BuildJob {
-                std::mutex mutex;
-                // std::atomic<bool> job_started;
-
-                std::atomic<bool> all_jobs_queued;
-                std::atomic<bool> all_jobs_complete;
-
-                // std::queue<Command> commands;
-                std::queue<Object*> objects;
-        };
-        // Thread pool to use based on -j argument (dispatch compilations round robin
-        // style) std::deque<std::pair<std::mutex, std::queue<Command>>>
-        // thread_queues_;
-        std::deque<BuildJob*> thread_queues_;
-        size_t jobs_ = 1;
-
-        bool skip_compile_commands;
-
-        void export_compile_commands(std::vector<CompileCommand>& compile_commands) {
-            if (skip_compile_commands) {
-                return;
-            }
-
-            std::ofstream compile_commands_file;
-
-            compile_commands_file.open("compile_commands.json");
-
-            if (compile_commands_file.is_open()) {
-                compile_commands_file << "[\n";
-
-                for (size_t i = 0; i < compile_commands.size(); i++) {
-                    compile_commands[i].add_to_file(compile_commands_file);
-                    compile_commands_file
-                        << (i < (compile_commands.size() - 1) ? ",\n" : "\n");
-                }
-
-                compile_commands_file << "]\n";
-                compile_commands_file.close();
-            } else {
-                exit(1);
-            }
-        }
-
-        void init_common() {
-            sym_link_dir_ = build_dir_ / "sym_links";
-            std::filesystem::create_directories(sym_link_dir_);
-            build_steps_.push_back(BuildStep{});
-            skip_compile_commands = false;
-
-            builtin = Builtin{
-                .os = Os::Invalid,
-                .mode = Mode::Release // REVIEW: Should the default be release mode?
-            };
-
-            // Set up which Os we are on
-#if defined(__linux__)
-            builtin.os = Os::Linux;
-#elif defined(__APPLE__)
-            builtin.os = Os::MacOS;
-#elif defined(__WIN32)
-            builtin.os = Os::Windows;
-#elif defined(__WIN64)
-            builtin.os = Os::Windows;
-#endif
-        }
-
-        void rebuildYourself(int argc, char** argv) {
-            std::filesystem::path build_cpp = "build.cpp";
-            std::filesystem::path build_hpp = "build.hpp";
-#ifdef __WIN32
-            std::filesystem::path build_exe = "build.exe";
-#else
-            std::filesystem::path build_exe = "build";
-#endif
-
-            if (!std::filesystem::exists(build_cpp) || !std::filesystem::exists(build_hpp)) {
-                std::println("Error: build.cpp or build.hpp not found");
-                return;
-            }
-
-            auto build_cpp_time = std::filesystem::last_write_time(build_cpp);
-            auto build_hpp_time = std::filesystem::last_write_time(build_hpp);
-
-            auto rebuild_func = [this, argc, argv]() {
-                std::println("Rebuilding build system...");
-                Command cmd({compiler_, "-std=c++23", "build.cpp", "-o", "build"});
-                cmd.print();
-                int result = cmd.exec();
-
-                if (result != 0) {
-                    std::println("Build system rebuild failed");
-                    exit(1);
-                }
-
-                Command run_cmd({"./build"});
-                for (int i = 1; i < argc; i++) {
-                    run_cmd.push_back(argv[i]);
-                }
-                run_cmd.exec();
-                exit(0);
-            };
-
-            // Check if build executable exists and compare times
-            if (std::filesystem::exists(build_exe)) {
-                auto build_exe_time = std::filesystem::last_write_time(build_exe);
-
-                // If either source file is newer than the executable, rebuild
-                if (build_cpp_time > build_exe_time || build_hpp_time > build_exe_time) {
-                    rebuild_func();
-                }
-            } else {
-                // No executable exists, need to build
-                rebuild_func();
-            }
-        }
-
-        void argParse(int argc, char** argv) {
-            std::vector<std::string> args;
-            for (int i = 0; i < argc; i++) {
-                args.push_back(std::string(argv[i]));
-            }
-
-            // TODO: Check for opposite flags
-            for (size_t i = 0; i < args.size(); i++) {
-                const auto& arg = args[i];
-                if (arg == "-Debug") {
-                    builtin.mode = Mode::Debug;
-                } else if (arg == "-Release") {
-                    builtin.mode = Mode::Release;
-                }
-
-                if (arg == "-j") {
-                    i++;
-
-                    auto [ptr, ec] = std::from_chars(args[i].data(), args[i].data() + args[i].size(), jobs_);
-
-                    if (ec == std::errc::invalid_argument) {
-                        std::println("Invalid Argument for -j flag: \"{}\"", ptr);
-                        exit(1);
-                    } else if (ec == std::errc::result_out_of_range) {
-                        std::println("Argument for -j flag out of range of int: \"{}\"", ptr);
-                        exit(1);
-                    }
+        std::forward_list<BuildTask*> collectTasks() {
+            std::forward_list<BuildTask*> all;
+            for (auto* group : groups_) {
+                for (auto& [key, task] : group->tasks()) {
+                    all.push_front(task.get());
                 }
             }
+            return all;
         }
 
-    public:
-        // The Build always starts with 1 build step
-        Build(const std::string& directory_name, int argc, char** argv)
-            : build_dir_(directory_name), compiler_(DEFAULT_COMPILER) {
-            init_common();
-            argParse(argc, argv);
-            rebuildYourself(argc, argv);
-        }
-
-        Build(const std::string& directory_name, const std::string& compiler, int argc, char** argv)
-            : build_dir_(directory_name), compiler_(compiler) {
-            init_common();
-            argParse(argc, argv);
-            rebuildYourself(argc, argv);
-        }
-
-        // delete the command, objects, includes, and links
-        ~Build() {
-            for (const auto& step : build_steps_) {
-                for (Command* cmd : step.pre_step_commands) {
-                    delete cmd;
-                }
-
-                for (Object* obj : step.objects) {
-                    delete obj;
-                }
-
-                for (Include* inc : step.includes) {
-                    delete inc;
-                }
-
-                for (Link* lnk : step.links) {
-                    delete lnk;
-                }
+        void buildDAG(std::string& compiler, const std::filesystem::path& sym_links) {
+            std::unordered_map<std::filesystem::path, BuildTask*> combined;
+            for (BuildTask* task : collectTasks()) {
+                combined[task->sourcePath().stem()] = task;
             }
 
-            for (size_t i = 0; i < jobs_; i++) {
-                BuildJob* job = thread_queues_[i];
-                delete job;
-            }
-        }
+            for (auto* group : groups_) {
+                for (auto& [key, task] : group->tasks()) {
+                    auto deps = group->listDependencies(task->object(), compiler, sym_links);
 
-        void skipCompileCommands() {
-            skip_compile_commands = true;
-        }
-
-        /*
-         * Usage: add_prebuild_command(new Command(...))
-         */
-        void addPrebuildCommand(Command* command) {
-            build_steps_.back().pre_step_commands.push_back(command);
-        }
-
-        /*
-         * Usage: add_object(new Object(...))
-         */
-        void addObject(Object* object) {
-            build_steps_.back().objects.push_back(object);
-        }
-
-        /*
-         * Usage: add_include(new Include(...))
-         */
-        void addInclude(Include* include) {
-            build_steps_.back().includes.push_back(include);
-        }
-
-        /*
-         * Usage: add_link(new Link(...))
-         */
-        void addLink(Link* link) { build_steps_.back().links.push_back(link); }
-
-        void addCompilationFlag(std::string&& flag) {
-            build_steps_.back().compilation_flags.push_back(flag);
-        }
-
-        void addLinkingFlag(std::string&& flag) {
-            build_steps_.back().linking_flags.push_back(flag);
-        }
-
-        void step() { build_steps_.push_back({}); }
-
-        void build() {
-            for (size_t i = 0; i < jobs_; i++) {
-                thread_queues_.emplace_back(new BuildJob);
-            }
-
-            std::vector<CompileCommand> compile_commands;
-            std::mutex compile_commands_mutex;
-
-            for (const auto& step : build_steps_) {
-                // Run any prebuild commands (these will be run not multithreaded)
-                for (const auto& command : step.pre_step_commands) {
-                    command->print();
-                    command->exec();
-                }
-
-                // Create the build step include paths
-                std::vector<std::string> includes;
-                for (const auto& include : step.includes) {
-                    includes.push_back("-I");
-                    includes.push_back(include->path(sym_link_dir_));
-                }
-
-                std::vector<std::string> object_files;
-                std::mutex object_files_mutex;
-
-                // Create jobs_ number of threads that will wait for commands to fill
-                // their queue and then execute those commands
-                std::atomic<bool> build_started = false;
-                std::atomic<bool> build_complete = false;
-
-                std::vector<std::thread> threads;
-
-                for (size_t i = 0; i < jobs_; i++) {
-                    thread_queues_[i]->all_jobs_queued.store(false, std::memory_order_seq_cst);
-                    thread_queues_[i]->all_jobs_complete.store(false, std::memory_order_seq_cst);
-
-                    threads.emplace_back([this, i, &includes, &step,
-                                          &object_files, &object_files_mutex, &compile_commands, &compile_commands_mutex]() {
-                        size_t job_number = i;
-                        bool queue_is_empty = thread_queues_[job_number]->objects.empty();
-                        bool all_jobs_queued = thread_queues_[job_number]->all_jobs_queued.load(std::memory_order_seq_cst);
-
-                        while (!queue_is_empty || !all_jobs_queued) {
-                            if (!queue_is_empty) {
-                                thread_queues_[job_number]->mutex.lock();
-                                Object* object = thread_queues_[job_number]->objects.front();
-                                thread_queues_[job_number]->objects.pop();
-                                thread_queues_[job_number]->mutex.unlock();
-
-                                std::string includes_string = "";
-                                for (const auto& include_command : includes) {
-                                    includes_string += include_command + " ";
-                                }
-
-                                std::string compilation_flags_string = "";
-                                for (const auto& flag : step.compilation_flags) {
-                                    compilation_flags_string += flag + " ";
-                                }
-
-                                object->compile(compiler_, compilation_flags_string, includes_string, build_dir_, object_files, object_files_mutex, compile_commands, compile_commands_mutex);
-                            }
-
-                            queue_is_empty = thread_queues_[job_number]->objects.empty();
-                            all_jobs_queued = thread_queues_[job_number]->all_jobs_queued.load(std::memory_order_seq_cst);
+                    for (const auto& dep : deps) {
+                        auto it = combined.find(dep.stem());
+                        if (it == combined.end()) {
+                            continue;
                         }
 
-                        thread_queues_[job_number]->all_jobs_complete.store(true, std::memory_order_seq_cst);
-                    });
-                }
+                        BuildTask& other = *it->second;
+                        if (&other == task.get()) {
+                            continue;
+                        }
 
-                // Compile the objects
-                size_t job_index_ = 0;
-                for (const auto& object : step.objects) {
-                    thread_queues_[job_index_]->mutex.lock();
-                    thread_queues_[job_index_]->objects.push(object);
-                    thread_queues_[job_index_]->mutex.unlock();
-
-                    job_index_ = (job_index_ + 1) % jobs_;
-                }
-
-                // After all the current job steps have been queued then let each thread know that
-                // there will be no more work
-                for (size_t i = 0; i < jobs_; i++) {
-                    thread_queues_[i]->all_jobs_queued.store(true, std::memory_order_seq_cst);
-                }
-
-                for (auto& t : threads) {
-                    t.join();
-                }
-
-                // Run the linking step of the build step before continuing to the next
-                // build step
-                Command linking_cmd({compiler_});
-
-                // If there are no linking flags then just use the default -std=c++23
-                if (step.linking_flags.empty()) {
-                    linking_cmd.push_back("-std=c++23");
-                } else {
-                    // Copy the flag to the command
-                    for (auto flag : step.linking_flags) {
-                        linking_cmd.push_back(flag);
+                        task->depends_on(other);
                     }
                 }
-
-                linking_cmd.push_back("-o");
-                linking_cmd.push_back(build_dir_.string() + "/main");
-
-                for (auto& object_file : object_files) {
-                    linking_cmd.push_back(object_file);
-                }
-
-                for (auto& link : step.links) {
-                    linking_cmd.push_back(link->linkable());
-                }
-
-                linking_cmd.print();
-                linking_cmd.exec();
             }
-
-            export_compile_commands(compile_commands);
         }
 };
