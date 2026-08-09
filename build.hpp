@@ -725,14 +725,15 @@ class Object {
             return path;
         }
 
-        template <__IsInclude... Includes>
-        CommandOutput compile(std::string& compiler, const std::filesystem::path& build_dir, const std::filesystem::path& sym_links, const Includes&... includes) {
+        CommandOutput compile(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) {
             output_path_ = outputPath(build_dir);
 
             std::filesystem::create_directories(output_path_.parent_path());
 
             Command cmd({compiler});
-            (cmd.push_back("-I" + includes.path(sym_links).string()), ...);
+            for (const auto& include_path : include_paths) {
+                cmd.push_back("-I" + include_path.string());
+            }
             cmd.push_back("-c");
             cmd.push_back(source_path_.string());
             cmd.push_back("-o");
@@ -741,10 +742,11 @@ class Object {
             return cmd.exec();
         }
 
-        template <__IsInclude... Includes>
-        std::vector<std::filesystem::path> listDependencies(std::string& compiler, const std::filesystem::path& sym_links, const Includes&... includes) {
+        std::vector<std::filesystem::path> listDependencies(const std::string& compiler, const std::vector<std::filesystem::path>& include_paths) {
             Command cmd({compiler});
-            (cmd.push_back("-I" + includes.path(sym_links).string()), ...);
+            for (const auto& include_path : include_paths) {
+                cmd.push_back("-I" + include_path.string());
+            }
             cmd.push_back("-MM");
             cmd.push_back(source_path_.string());
 
@@ -858,8 +860,7 @@ class __BuildGroupBase {
         virtual ~__BuildGroupBase() = default;
 
         virtual std::unordered_map<std::filesystem::path, std::unique_ptr<Task>>& tasks() = 0;
-        virtual std::vector<std::filesystem::path> listDependencies(Object& obj, const std::filesystem::path& sym_links) = 0;
-        virtual CommandOutput compile(Object& obj, const std::filesystem::path& build_dir, const std::filesystem::path& sym_links) = 0;
+        virtual std::vector<std::filesystem::path> includePaths(const std::filesystem::path& sym_links) = 0;
         virtual std::string& compiler() = 0;
 
         // No-op if the group already has its own compiler (see BuildGroup's two
@@ -893,12 +894,12 @@ class Task {
 
         void execute(const std::filesystem::path& build_dir) {
             std::filesystem::path sym_links = build_dir / "sym_links";
-            group_->compile(object_, build_dir, sym_links);
+            object_.compile(group_->compiler(), build_dir, group_->includePaths(sym_links));
         }
 
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
             std::filesystem::path sym_links = build_dir / "sym_links";
-            return group_->listDependencies(object_, sym_links);
+            return object_.listDependencies(group_->compiler(), group_->includePaths(sym_links));
         }
 
         const std::filesystem::path& sourcePath() const { return object_.sourcePath(); }
@@ -970,16 +971,10 @@ class BuildGroup : public __BuildGroupBase {
 
         std::unordered_map<std::filesystem::path, std::unique_ptr<Task>>& tasks() override { return tasks_; }
 
-        std::vector<std::filesystem::path> listDependencies(Object& obj, const std::filesystem::path& sym_links) override {
-            return std::apply(
-                [&](const auto&... incs) { return obj.listDependencies(*compiler_, sym_links, incs...); }, includes_
-            );
-        }
-
-        CommandOutput compile(Object& obj, const std::filesystem::path& build_dir, const std::filesystem::path& sym_links) override {
-            return std::apply(
-                [&](const auto&... incs) { return obj.compile(*compiler_, build_dir, sym_links, incs...); }, includes_
-            );
+        std::vector<std::filesystem::path> includePaths(const std::filesystem::path& sym_links) override {
+            std::vector<std::filesystem::path> paths;
+            std::apply([&](const auto&... incs) { (paths.push_back(incs.path(sym_links)), ...); }, includes_);
+            return paths;
         }
 
         std::string& compiler() override { return *compiler_; }
