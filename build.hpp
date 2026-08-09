@@ -981,6 +981,39 @@ class Output {
                 value_
             );
         }
+
+        // Object's own source file for the Object variant; Binary/Library have no
+        // source file, so their name stands in — this is only ever used as a DAG key
+        // (see BuildGroup::addTask), not as something fed to the compiler.
+        const std::filesystem::path& sourcePath() const {
+            return std::visit(
+                [](const auto& out) -> const std::filesystem::path& {
+                    using T = std::decay_t<decltype(out)>;
+
+                    if constexpr (std::same_as<T, Object>) {
+                        return out.sourcePath();
+                    } else {
+                        return out.name();
+                    }
+                },
+                value_
+            );
+        }
+
+        std::filesystem::path outputPath(const std::filesystem::path& build_dir) const {
+            return std::visit(
+                [&](const auto& out) -> std::filesystem::path {
+                    using T = std::decay_t<decltype(out)>;
+
+                    if constexpr (std::same_as<T, Object>) {
+                        return out.outputPath(build_dir);
+                    } else {
+                        return out.path(build_dir);
+                    }
+                },
+                value_
+            );
+        }
 };
 
 class Task;
@@ -1002,20 +1035,20 @@ class __BuildGroupBase {
         virtual void setDefaultCompiler(const std::string& compiler) = 0;
 };
 
-// A single task: owns the Object it compiles, plus its place in the dependency DAG.
-// Set once the task is registered (see BuildGroup::addTask). build_dir is passed into
-// execute()/listDependencies() rather than stored, since nothing here owns it — Build
-// does.
+// A single task: owns the Output it produces (an Object, Binary, or Library), plus its
+// place in the dependency DAG. Set once the task is registered (see
+// BuildGroup::addTask). build_dir is passed into execute()/listDependencies() rather
+// than stored, since nothing here owns it — Build does.
 class Task {
     private:
-        Object                    object_;
+        Output                    output_;
         __BuildGroupBase*         group_ = nullptr;
         std::vector<Task*>        children_;
         std::vector<Task*>        parents_;
         std::atomic<i32>          parent_count_;
 
     public:
-        Task(Object object) : object_(std::move(object)), parent_count_(0) {}
+        Task(Output output) : output_(std::move(output)), parent_count_(0) {}
 
         Task& depends_on(Task& dependency) {
             dependency.children_.push_back(this);
@@ -1028,17 +1061,17 @@ class Task {
 
         void execute(const std::filesystem::path& build_dir) {
             std::filesystem::path sym_links = build_dir / "sym_links";
-            object_.compile(group_->compiler(), build_dir, group_->includePaths(sym_links));
+            output_.execute(group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir));
         }
 
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
             std::filesystem::path sym_links = build_dir / "sym_links";
-            return object_.listDependencies(group_->compiler(), group_->includePaths(sym_links));
+            return output_.listDependencies(group_->compiler(), group_->includePaths(sym_links));
         }
 
-        const std::filesystem::path& sourcePath() const { return object_.sourcePath(); }
+        const std::filesystem::path& sourcePath() const { return output_.sourcePath(); }
 
-        std::filesystem::path outputPath(const std::filesystem::path& build_dir) const { return object_.outputPath(build_dir); }
+        std::filesystem::path outputPath(const std::filesystem::path& build_dir) const { return output_.outputPath(build_dir); }
 
         const std::vector<Task*>& parents() const { return parents_; }
 
@@ -1062,6 +1095,34 @@ class Task {
             oss << "]";
             RLOG(LL_DEBUG, oss.str());
         }
+
+    private:
+        // Walks parents() transitively, collecting each upstream task's compiled
+        // output path, deduplicated for diamond dependencies. Read-only: the DAG edges
+        // themselves are built once by depends_on(), not here.
+        std::vector<std::filesystem::path> collectObjectFiles(const std::filesystem::path& build_dir) const {
+            std::vector<std::filesystem::path> object_files;
+            std::unordered_set<const Task*>    visited;
+
+            std::function<void(const Task*)> collect = [&](const Task* task) {
+                if (visited.contains(task)) {
+                    return;
+                }
+                visited.insert(task);
+
+                object_files.push_back(task->outputPath(build_dir));
+
+                for (Task* parent : task->parents()) {
+                    collect(parent);
+                }
+            };
+
+            for (Task* parent : parents_) {
+                collect(parent);
+            }
+
+            return object_files;
+        }
 };
 
 template <__IsInclude... Includes>
@@ -1082,8 +1143,8 @@ class BuildGroup : public __BuildGroupBase {
             }
         }
 
-        Task& addTask(Object object) {
-            Task&                  new_task = *(new Task(std::move(object)));
+        Task& addTask(Output output) {
+            Task&                  new_task = *(new Task(std::move(output)));
             new_task.setGroup(*this);
             std::filesystem::path key = new_task.sourcePath().stem();
 
@@ -1095,8 +1156,8 @@ class BuildGroup : public __BuildGroupBase {
             return new_task;
         }
 
-        Task& addTask(Object object, std::initializer_list<std::reference_wrapper<Task>> dependencies) {
-            Task& new_task = addTask(std::move(object));
+        Task& addTask(Output output, std::initializer_list<std::reference_wrapper<Task>> dependencies) {
+            Task& new_task = addTask(std::move(output));
             for (Task& dependency : dependencies) {
                 new_task.depends_on(dependency);
             }
@@ -1220,6 +1281,7 @@ class Build {
 
         void build() {
             buildDAG();
+	    print();
 
             std::forward_list<Task*> pending = collectTasks();
 
