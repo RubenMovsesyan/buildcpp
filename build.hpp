@@ -728,6 +728,7 @@ class Object {
         }
 
         CommandOutput compile(const std::string& compiler, const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& include_paths) {
+            RLOG(LL_INFO, "Compiling: " + source_path_.string());
             output_path_ = outputPath(build_dir);
 
             std::filesystem::create_directories(output_path_.parent_path());
@@ -1014,6 +1015,37 @@ class Output {
                 value_
             );
         }
+
+        // Doesn't consider header includes yet (see Object::listDependencies) — only
+        // the Object variant's own source file, or the Binary/Library variant's object
+        // files. Missing output, or any input newer than the output, means stale.
+        bool isStale(const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files) const {
+            std::filesystem::path output_path = outputPath(build_dir);
+
+            if (!std::filesystem::exists(output_path)) {
+                return true;
+            }
+
+            std::filesystem::file_time_type output_time = std::filesystem::last_write_time(output_path);
+
+            return std::visit(
+                [&](const auto& out) -> bool {
+                    using T = std::decay_t<decltype(out)>;
+
+                    if constexpr (std::same_as<T, Object>) {
+                        return std::filesystem::last_write_time(out.sourcePath()) > output_time;
+                    } else {
+                        for (const auto& object_file : object_files) {
+                            if (!std::filesystem::exists(object_file) || std::filesystem::last_write_time(object_file) > output_time) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                },
+                value_
+            );
+        }
 };
 
 class Task;
@@ -1058,6 +1090,7 @@ class Task {
         std::vector<Task*>        children_;
         std::vector<Task*>        parents_;
         std::atomic<i32>          parent_count_;
+        std::optional<bool>       needs_rebuild_;
 
     public:
         Task(Output output) : output_(std::move(output)), parent_count_(0) {}
@@ -1080,6 +1113,33 @@ class Task {
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
             std::filesystem::path sym_links = build_dir / "sym_links";
             return output_.listDependencies(group_->compiler(), group_->includePaths(sym_links));
+        }
+
+        // Memoized: own staleness OR any parent's (recursive). Safe to call from
+        // multiple worker threads without locking the cache — a task is only ever
+        // dispatched after every parent's needsRebuild()+complete() has already run on
+        // its own thread, and complete()'s atomic decrement of parent_count_ is what
+        // publishes that thread's writes (including needs_rebuild_) before this task's
+        // parentCount() is observed as 0 and it gets picked up.
+        bool needsRebuild() {
+            if (needs_rebuild_.has_value()) {
+                return *needs_rebuild_;
+            }
+
+            std::filesystem::path build_dir = group_->buildDir();
+            bool                  stale     = output_.isStale(build_dir, collectObjectFiles(build_dir));
+
+            if (!stale) {
+                for (Task* parent : parents_) {
+                    if (parent->needsRebuild()) {
+                        stale = true;
+                        break;
+                    }
+                }
+            }
+
+            needs_rebuild_ = stale;
+            return stale;
         }
 
         const std::filesystem::path& sourcePath() const { return output_.sourcePath(); }
@@ -1213,7 +1273,9 @@ class ThreadPool {
                 }
 
                 if (task != nullptr) {
-                    task->execute();
+                    if (task->needsRebuild()) {
+                        task->execute();
+                    }
                     task->complete();
                 } else if (dispatch_complete_.load()) {
                     break;
