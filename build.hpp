@@ -588,6 +588,10 @@ class Command {
     private:
         std::vector<std::string>             command_chain_;
         std::optional<std::filesystem::path> exec_dir_;
+        // Only meaningful when this Command is going into an Output (see
+        // Output::assignCommandName) — a bare Command used internally (e.g.
+        // Object::compileCommand) never sets this.
+        std::filesystem::path                name_;
 
     public:
         Command() = default;
@@ -602,6 +606,16 @@ class Command {
         // across the thread pool's worker threads, so a real chdir() would race across
         // threads compiling different files.
         void setExecDir(const std::filesystem::path& dir) { exec_dir_ = dir; }
+
+        void setName(const std::filesystem::path& name) { name_ = name; }
+
+        const std::filesystem::path& name() const { return name_; }
+
+        // Symbolic only — a Command has no predictable single output file, so this is
+        // never expected to point at anything real. It only exists so Output's
+        // sourcePath()/outputPath() dispatch can treat Command the same as Binary/
+        // Library without a special case.
+        std::filesystem::path path(const std::filesystem::path& build_dir) const { return build_dir / name_; }
 
         const std::vector<std::string>& command_chain() const { return command_chain_; }
 
@@ -1007,22 +1021,24 @@ class Library {
         }
 };
 
-// Wraps whatever a task ultimately produces. Not slotted into Task yet — this is just
-// the shape: once it is, Task will hold an Output in place of a bare Object, and
-// object_files (this task's transitive parents' compiled outputs) will come from the
-// DAG walk Task already does for LinkTask/LibraryTask today.
+class Build;
+
+// Wraps whatever a task ultimately produces: a compiled Object, a linked Binary/
+// Library, or a bare Command (a pre/post-build step with no compile or link semantics
+// of its own — see Output::assignCommandName).
 class Output {
     private:
-        std::variant<Object, Binary, Library> value_;
+        std::variant<Object, Binary, Library, Command> value_;
 
     public:
         Output(Object object) : value_(std::move(object)) {}
         Output(Binary binary) : value_(std::move(binary)) {}
         Output(Library library) : value_(std::move(library)) {}
+        Output(Command command) : value_(std::move(command)) {}
 
         // Sorts by variant: Object gets compile_flags; Binary/Library get link_flags and
-        // linkables (-lfoo/-L.../-framework Foo) — each variant only ever sees what's
-        // meant for it.
+        // linkables (-lfoo/-L.../-framework Foo); Command just runs — none of the
+        // compile/link machinery applies to it.
         CommandOutput execute(
             const std::string&                         compiler,
             const std::filesystem::path&                build_dir,
@@ -1038,6 +1054,8 @@ class Output {
 
                     if constexpr (std::same_as<T, Object>) {
                         return out.compile(compiler, build_dir, include_paths, compile_flags);
+                    } else if constexpr (std::same_as<T, Command>) {
+                        return out.exec();
                     } else {
                         return out.link(compiler, build_dir, object_files, link_flags, linkables);
                     }
@@ -1112,6 +1130,12 @@ class Output {
 
                     if constexpr (std::same_as<T, Object>) {
                         return std::filesystem::last_write_time(out.sourcePath()) > output_time;
+                    } else if constexpr (std::same_as<T, Command>) {
+                        // No principled way to know if a shell command's effects are
+                        // up to date without it telling us what it reads/writes —
+                        // matches build.h's own pre-build commands, which also always
+                        // rerun unconditionally.
+                        return true;
                     } else {
                         for (const auto& object_file : object_files) {
                             if (!std::filesystem::exists(object_file) || std::filesystem::last_write_time(object_file) > output_time) {
@@ -1124,6 +1148,12 @@ class Output {
                 value_
             );
         }
+
+        bool isObject() const { return std::holds_alternative<Object>(value_); }
+
+        // Defined out-of-line, after Build, since Build isn't a complete type yet here.
+        // No-op for every variant except Command, which gets "cmd_<Build::nextCommandId()>".
+        void assignCommandName(Build& build);
 
         // Only the Object variant ever produces a compile-commands entry — Binary/Library
         // link steps aren't compilations of a translation unit.
@@ -1193,6 +1223,8 @@ class Task {
 
         std::filesystem::path outputPath(const std::filesystem::path& build_dir) const { return output_.outputPath(build_dir); }
 
+        bool isObject() const { return output_.isObject(); }
+
         const std::vector<Task*>& parents() const { return parents_; }
 
         i32 parentCount() const { return parent_count_.load(); }
@@ -1219,7 +1251,10 @@ class Task {
     private:
         // Walks parents() transitively, collecting each upstream task's compiled
         // output path, deduplicated for diamond dependencies. Read-only: the DAG edges
-        // themselves are built once by depends_on(), not here.
+        // themselves are built once by depends_on(), not here. Only Object-backed
+        // tasks contribute — a Command (or, transitively, another Binary/Library)
+        // sitting somewhere in the ancestor chain has no real object file to hand the
+        // linker.
         std::vector<std::filesystem::path> collectObjectFiles(const std::filesystem::path& build_dir) const {
             std::vector<std::filesystem::path> object_files;
             std::unordered_set<const Task*>    visited;
@@ -1230,7 +1265,9 @@ class Task {
                 }
                 visited.insert(task);
 
-                object_files.push_back(task->outputPath(build_dir));
+                if (task->isObject()) {
+                    object_files.push_back(task->outputPath(build_dir));
+                }
 
                 for (Task* parent : task->parents()) {
                     collect(parent);
@@ -1287,6 +1324,8 @@ class BuildGroup {
         void addLink(T link) { links_.emplace_back(std::move(link)); }
 
         Task& addTask(Output output) {
+            output.assignCommandName(*build_);
+
             Task&                  new_task = *(new Task(std::move(output)));
             new_task.setGroup(*this);
             std::filesystem::path key = new_task.sourcePath().stem();
@@ -1399,6 +1438,9 @@ class Build {
         std::unordered_map<std::filesystem::path, CompileCommandEntry> compile_commands_;
         std::mutex                                                      compile_commands_mutex_;
         std::atomic<bool>                                               failed_ = false;
+        // Not atomic: only ever touched from addTask() during single-threaded build
+        // setup, before the thread pool has any work to race over.
+        usize                                                            command_counter_ = 0;
 
     public:
         Build(const std::filesystem::path& build_dir, const std::string& compiler)
@@ -1425,6 +1467,9 @@ class Build {
         bool hasFailed() const { return failed_.load(); }
 
         void reportFailure() { failed_.store(true); }
+
+        // 1-indexed: after N commands have been added, the Nth one is "cmd_N".
+        usize nextCommandId() { return ++command_counter_; }
 
         // Recorded unconditionally by every worker before checking needsRebuild(), so
         // compile_commands.json stays complete even when most tasks are skipped on an
@@ -1536,6 +1581,19 @@ class Build {
 };
 
 inline const std::filesystem::path& BuildGroup::buildDir() const { return build_->buildDir(); }
+
+inline void Output::assignCommandName(Build& build) {
+    std::visit(
+        [&](auto& out) {
+            using T = std::decay_t<decltype(out)>;
+
+            if constexpr (std::same_as<T, Command>) {
+                out.setName("cmd_" + std::to_string(build.nextCommandId()));
+            }
+        },
+        value_
+    );
+}
 
 inline bool Task::execute() {
     std::filesystem::path build_dir = group_->buildDir();
