@@ -1017,12 +1017,19 @@ class Output {
 };
 
 class Task;
+class Build;
 
 // Not just Object&: a group's includes_ tuple type varies per BuildGroup<Includes...>
 // instantiation, so this is the only generically-typed handle a task can hold onto its
 // owning group with. The group now owns the compiler (see BuildGroup), so these no
 // longer take one as a parameter.
 class __BuildGroupBase {
+    private:
+        // Set once the group is registered (see Build::addGroup). Non-virtual: unlike
+        // tasks()/includePaths()/compiler(), this doesn't vary per BuildGroup<Includes...>
+        // instantiation, so every group can just share the same storage here.
+        Build* build_ = nullptr;
+
     public:
         virtual ~__BuildGroupBase() = default;
 
@@ -1033,12 +1040,17 @@ class __BuildGroupBase {
         // No-op if the group already has its own compiler (see BuildGroup's two
         // constructors) — only fills in Build's default when one wasn't specified.
         virtual void setDefaultCompiler(const std::string& compiler) = 0;
+
+        void setBuild(Build& build) { build_ = &build; }
+
+        // Defined out-of-line, after Build, since Build isn't a complete type yet here.
+        const std::filesystem::path& buildDir() const;
 };
 
 // A single task: owns the Output it produces (an Object, Binary, or Library), plus its
 // place in the dependency DAG. Set once the task is registered (see
-// BuildGroup::addTask). build_dir is passed into execute()/listDependencies() rather
-// than stored, since nothing here owns it — Build does.
+// BuildGroup::addTask). execute() reaches build_dir through group_ -> Build rather than
+// taking it as a parameter, since nothing here owns it.
 class Task {
     private:
         Output                    output_;
@@ -1059,7 +1071,8 @@ class Task {
 
         void setGroup(__BuildGroupBase& group) { group_ = &group; }
 
-        void execute(const std::filesystem::path& build_dir) {
+        void execute() {
+            std::filesystem::path build_dir = group_->buildDir();
             std::filesystem::path sym_links = build_dir / "sym_links";
             output_.execute(group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir));
         }
@@ -1200,6 +1213,7 @@ class ThreadPool {
                 }
 
                 if (task != nullptr) {
+                    task->execute();
                     task->complete();
                 } else if (dispatch_complete_.load()) {
                     break;
@@ -1262,8 +1276,11 @@ class Build {
 
         void addGroup(__BuildGroupBase* group) {
             group->setDefaultCompiler(default_compiler_);
+            group->setBuild(*this);
             groups_.push_back(group);
         }
+
+        const std::filesystem::path& buildDir() const { return build_dir_; }
 
         void print() const {
             usize total = 0;
@@ -1339,3 +1356,5 @@ class Build {
             }
         }
 };
+
+inline const std::filesystem::path& __BuildGroupBase::buildDir() const { return build_->buildDir(); }
