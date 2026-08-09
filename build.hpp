@@ -558,9 +558,11 @@ inline void __Log_file_impl(const char* path, LogLevel level, const char* file, 
 #include <filesystem>
 #include <forward_list>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <string>
@@ -839,20 +841,87 @@ concept __IsLink = std::same_as<T, __LinkDependency> || std::same_as<T, __LinkPa
 #endif
     ;
 
-class BuildTask {
-    private:
-        Object                  task_;
-        std::vector<BuildTask*> children_;
-        std::atomic<i32>        parent_count_;
+class BuildTask;
+
+// Not just Object&: a group's includes_ tuple type varies per BuildGroup<Includes...>
+// instantiation, so this is the only generically-typed handle a task can hold onto its
+// owning group with. The group now owns the compiler (see BuildGroup), so these no
+// longer take one as a parameter.
+class __BuildGroupBase {
+    public:
+        virtual ~__BuildGroupBase() = default;
+
+        virtual std::unordered_map<std::filesystem::path, std::unique_ptr<BuildTask>>& tasks() = 0;
+        virtual std::vector<std::filesystem::path> listDependencies(Object& obj, const std::filesystem::path& sym_links) = 0;
+        virtual CommandOutput compile(Object& obj, const std::filesystem::path& build_dir, const std::filesystem::path& sym_links) = 0;
+
+        // No-op if the group already has its own compiler (see BuildGroup's two
+        // constructors) — only fills in Build's default when one wasn't specified.
+        virtual void setDefaultCompiler(const std::string& compiler) = 0;
+};
+
+// References the owning group rather than owning a copy, so that data doesn't live in
+// two places. Set once the task is registered (see BuildGroup::addTask). build_dir is
+// passed into execute()/listDependencies() rather than stored, since nothing here owns
+// it — Build does.
+class TaskBase {
+    protected:
+        __BuildGroupBase* group_ = nullptr;
 
     public:
-        BuildTask(Object task) : task_(std::move(task)), parent_count_(0) {}
+        virtual ~TaskBase() = default;
 
-        // Heap-allocated, not by value: std::atomic member blocks move/copy, and
-        // children_ pointers need a fixed address anyway.
-        static BuildTask& create(Object task) {
-            return *(new BuildTask(std::move(task)));
+        void setGroup(__BuildGroupBase& group) { group_ = &group; }
+
+        virtual void execute(const std::filesystem::path& build_dir) = 0;
+        virtual const std::filesystem::path& sourcePath() const = 0;
+        virtual std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) = 0;
+};
+
+class ObjectTask : public TaskBase {
+    private:
+        Object object_;
+
+    public:
+        ObjectTask(Object object) : object_(std::move(object)) {}
+
+        const std::filesystem::path& sourcePath() const override { return object_.sourcePath(); }
+
+        std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) override {
+            std::filesystem::path sym_links = build_dir / "sym_links";
+            return group_->listDependencies(object_, sym_links);
         }
+
+        void execute(const std::filesystem::path& build_dir) override {
+            std::filesystem::path sym_links = build_dir / "sym_links";
+            group_->compile(object_, build_dir, sym_links);
+        }
+};
+
+template <typename Kind>
+struct __TaskTypeOf;
+
+template <>
+struct __TaskTypeOf<Object> {
+        using type = ObjectTask;
+};
+
+template <typename Kind>
+using Task = typename __TaskTypeOf<Kind>::type;
+
+class BuildTask {
+    private:
+        TaskBase*                task_;
+        std::vector<BuildTask*>  children_;
+        std::atomic<i32>         parent_count_;
+
+    public:
+        // Non-owning: task_ points at an externally-owned Task<Kind> (the caller's
+        // local variable), so the task data doesn't live in two places. Heap-allocated
+        // by whoever constructs this (see BuildGroup::addTask), not by value:
+        // std::atomic member blocks move/copy, and children_ pointers need a fixed
+        // address anyway.
+        BuildTask(TaskBase& task) : task_(&task), parent_count_(0) {}
 
         BuildTask& depends_on(BuildTask& dependency) {
             dependency.children_.push_back(this);
@@ -860,9 +929,15 @@ class BuildTask {
             return *this;
         }
 
-        Object& object() { return task_; }
+        void setGroup(__BuildGroupBase& group) { task_->setGroup(group); }
 
-        const std::filesystem::path& sourcePath() const { return task_.sourcePath(); }
+        void execute(const std::filesystem::path& build_dir) { task_->execute(build_dir); }
+
+        std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
+            return task_->listDependencies(build_dir);
+        }
+
+        const std::filesystem::path& sourcePath() const { return task_->sourcePath(); }
 
         i32 parentCount() const { return parent_count_.load(); }
 
@@ -886,34 +961,51 @@ class BuildTask {
         }
 };
 
-class __BuildGroupBase {
-    public:
-        virtual ~__BuildGroupBase() = default;
-
-        virtual std::unordered_map<std::filesystem::path, std::unique_ptr<BuildTask>>& tasks() = 0;
-        virtual std::vector<std::filesystem::path> listDependencies(Object& obj, std::string& compiler, const std::filesystem::path& sym_links) = 0;
-};
-
 template <__IsInclude... Includes>
 class BuildGroup : public __BuildGroupBase {
     private:
         std::unordered_map<std::filesystem::path, std::unique_ptr<BuildTask>> tasks_;
         std::tuple<Includes...>                                               includes_;
+        std::optional<std::string>                                            compiler_;
 
     public:
         BuildGroup(Includes... includes) : includes_(includes...) {}
 
-        BuildTask& addTask(BuildTask& task) {
-            std::filesystem::path key = task.object().sourcePath().stem();
-            tasks_[key] = std::unique_ptr<BuildTask>(&task);
-            return task;
+        BuildGroup(const std::string& compiler, Includes... includes) : includes_(includes...), compiler_(compiler) {}
+
+        void setDefaultCompiler(const std::string& compiler) override {
+            if (!compiler_.has_value()) {
+                compiler_ = compiler;
+            }
+        }
+
+        BuildTask& addTask(TaskBase& task) {
+            BuildTask&             new_task = *(new BuildTask(task));
+            new_task.setGroup(*this);
+            std::filesystem::path key = new_task.sourcePath().stem();
+            tasks_[key] = std::unique_ptr<BuildTask>(&new_task);
+            return new_task;
+        }
+
+        BuildTask& addTask(TaskBase& task, std::initializer_list<std::reference_wrapper<BuildTask>> dependencies) {
+            BuildTask& new_task = addTask(task);
+            for (BuildTask& dependency : dependencies) {
+                new_task.depends_on(dependency);
+            }
+            return new_task;
         }
 
         std::unordered_map<std::filesystem::path, std::unique_ptr<BuildTask>>& tasks() override { return tasks_; }
 
-        std::vector<std::filesystem::path> listDependencies(Object& obj, std::string& compiler, const std::filesystem::path& sym_links) override {
+        std::vector<std::filesystem::path> listDependencies(Object& obj, const std::filesystem::path& sym_links) override {
             return std::apply(
-                [&](const auto&... incs) { return obj.listDependencies(compiler, sym_links, incs...); }, includes_
+                [&](const auto&... incs) { return obj.listDependencies(*compiler_, sym_links, incs...); }, includes_
+            );
+        }
+
+        CommandOutput compile(Object& obj, const std::filesystem::path& build_dir, const std::filesystem::path& sym_links) override {
+            return std::apply(
+                [&](const auto&... incs) { return obj.compile(*compiler_, build_dir, sym_links, incs...); }, includes_
             );
         }
 };
@@ -986,19 +1078,25 @@ class ThreadPool {
 class Build {
     private:
         std::filesystem::path          build_dir_;
+        std::string                    default_compiler_;
         std::vector<__BuildGroupBase*> groups_;
         ThreadPool                     thread_pool_;
 
     public:
-        Build(const std::filesystem::path& build_dir) : build_dir_(build_dir) {
+        Build(const std::filesystem::path& build_dir, const std::string& compiler)
+            : build_dir_(build_dir), default_compiler_(compiler) {
             std::filesystem::create_directories(build_dir_);
         }
 
-        Build(const std::filesystem::path& build_dir, std::initializer_list<__BuildGroupBase*> groups) : Build(build_dir) {
-            groups_ = groups;
+        Build(const std::filesystem::path& build_dir, const std::string& compiler, std::initializer_list<__BuildGroupBase*> groups)
+            : Build(build_dir, compiler) {
+            for (__BuildGroupBase* group : groups) {
+                addGroup(group);
+            }
         }
 
         void addGroup(__BuildGroupBase* group) {
+            group->setDefaultCompiler(default_compiler_);
             groups_.push_back(group);
         }
 
@@ -1016,8 +1114,8 @@ class Build {
             }
         }
 
-        void build(std::string& compiler, const std::filesystem::path& sym_links) {
-            buildDAG(compiler, sym_links);
+        void build() {
+            buildDAG();
 
             std::forward_list<BuildTask*> pending = collectTasks();
 
@@ -1050,29 +1148,27 @@ class Build {
             return all;
         }
 
-        void buildDAG(std::string& compiler, const std::filesystem::path& sym_links) {
+        void buildDAG() {
             std::unordered_map<std::filesystem::path, BuildTask*> combined;
             for (BuildTask* task : collectTasks()) {
                 combined[task->sourcePath().stem()] = task;
             }
 
-            for (auto* group : groups_) {
-                for (auto& [key, task] : group->tasks()) {
-                    auto deps = group->listDependencies(task->object(), compiler, sym_links);
+            for (BuildTask* task : collectTasks()) {
+                auto deps = task->listDependencies(build_dir_);
 
-                    for (const auto& dep : deps) {
-                        auto it = combined.find(dep.stem());
-                        if (it == combined.end()) {
-                            continue;
-                        }
-
-                        BuildTask& other = *it->second;
-                        if (&other == task.get()) {
-                            continue;
-                        }
-
-                        task->depends_on(other);
+                for (const auto& dep : deps) {
+                    auto it = combined.find(dep.stem());
+                    if (it == combined.end()) {
+                        continue;
                     }
+
+                    BuildTask& other = *it->second;
+                    if (&other == task) {
+                        continue;
+                    }
+
+                    task->depends_on(other);
                 }
             }
         }
