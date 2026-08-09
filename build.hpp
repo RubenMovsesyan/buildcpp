@@ -1165,13 +1165,16 @@ class Task {
 
         void setGroup(__BuildGroupBase& group) { group_ = &group; }
 
-        void execute() {
+        // True on success. CommandOutput's exit_code was previously discarded here —
+        // this is the one place that actually inspects it.
+        bool execute() {
             std::filesystem::path build_dir = group_->buildDir();
             std::filesystem::path sym_links = build_dir / "sym_links";
-            output_.execute(
+            CommandOutput result = output_.execute(
                 group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir),
                 group_->compileFlags(), group_->linkFlags()
             );
+            return result.exit_code == 0;
         }
 
         std::vector<std::filesystem::path> listDependencies(const std::filesystem::path& build_dir) {
@@ -1390,6 +1393,7 @@ class Build {
         ThreadPool                                                      thread_pool_;
         std::unordered_map<std::filesystem::path, CompileCommandEntry> compile_commands_;
         std::mutex                                                      compile_commands_mutex_;
+        std::atomic<bool>                                               failed_ = false;
 
     public:
         Build(const std::filesystem::path& build_dir, const std::string& compiler)
@@ -1412,6 +1416,15 @@ class Build {
         }
 
         const std::filesystem::path& buildDir() const { return build_dir_; }
+
+        // Not what actually stops the other worker threads — RLOG(LL_FATAL, ...) does
+        // that for free by calling exit() the instant any thread hits a failure, which
+        // is process-wide. This just lets a thread skip starting new work in the narrow
+        // window before that exit() call lands, and keeps two near-simultaneous
+        // failures from racing to log a garbled fatal message.
+        bool hasFailed() const { return failed_.load(); }
+
+        void reportFailure() { failed_.store(true); }
 
         // Recorded unconditionally by every worker before checking needsRebuild(), so
         // compile_commands.json stays complete even when most tasks are skipped on an
@@ -1539,11 +1552,14 @@ inline void ThreadPool::workerLoop() {
         }
 
         if (task != nullptr) {
-            if (auto entry = task->compileCommandEntry()) {
-                build_->recordCompileCommand(std::move(*entry));
-            }
-            if (task->needsRebuild()) {
-                task->execute();
+            if (!build_->hasFailed()) {
+                if (auto entry = task->compileCommandEntry()) {
+                    build_->recordCompileCommand(std::move(*entry));
+                }
+                if (task->needsRebuild() && !task->execute()) {
+                    build_->reportFailure();
+                    RLOG(LL_FATAL, "Build step failed: " + task->sourcePath().string());
+                }
             }
             task->complete();
         } else if (dispatch_complete_.load()) {
