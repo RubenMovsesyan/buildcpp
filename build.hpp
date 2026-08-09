@@ -1446,6 +1446,14 @@ class ThreadPool {
         }
 };
 
+template <typename T>
+concept __IsArgValue = std::same_as<T, std::string>
+    || std::same_as<T, i8> || std::same_as<T, i16> || std::same_as<T, i32> || std::same_as<T, i64>
+    || std::same_as<T, u8> || std::same_as<T, u16> || std::same_as<T, u32> || std::same_as<T, u64>
+    || std::same_as<T, f32> || std::same_as<T, f64>;
+
+using __ArgVariant = std::variant<std::string, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64>;
+
 class Build {
     private:
         std::filesystem::path                                           build_dir_;
@@ -1463,16 +1471,104 @@ class Build {
         // setup, before the thread pool has any work to race over.
         usize                                                            command_counter_ = 0;
         i32                                                              jobs_;
+        // Kept around so parseArgs() (called separately, after any defineArg() calls
+        // in the build script) can scan them — not consumed at construction time.
+        int                                                              argc_;
+        char**                                                          argv_;
+        // Each name maps to a placeholder of the type it was defineArg<T>()'d with —
+        // that's how parseArgs() knows which alternative to parse a given --flag's
+        // value into, without needing T at the point it's actually scanning argv.
+        std::unordered_map<std::string, __ArgVariant>                  arg_defs_;
+        std::unordered_map<std::string, __ArgVariant>                  arg_values_;
 
     public:
         Build(const std::filesystem::path& build_dir, const std::string& compiler, int argc, char** argv)
-            : build_dir_(build_dir), default_compiler_(compiler) {
+            : build_dir_(build_dir), default_compiler_(compiler), argc_(argc), argv_(argv) {
             selfRebuild(argc, argv);
 
             jobs_ = parseJobs(argc, argv);
 
             std::filesystem::create_directories(build_dir_);
             thread_pool_.setBuild(*this);
+        }
+
+        // -j is a build-tool built-in (controls ThreadPool sizing), parsed eagerly and
+        // unconditionally — unlike defineArg()'d custom flags, it has to be known
+        // before build() starts even if the script never touches the custom-arg system
+        // at all.
+        template <__IsArgValue T>
+        void defineArg(const std::string& name) { arg_defs_[name] = T{}; }
+
+        // Explicit, not automatic — matches print()/exportCompileCommands()'s existing
+        // style. Call after every defineArg() you want recognized; safe to call more
+        // than once. Unrecognized --flags and unparseable values are logged and
+        // skipped, not fatal — a bad argument shouldn't block the rest of the build.
+        void parseArgs() {
+            for (int i = 1; i < argc_; ++i) {
+                std::string token = argv_[i];
+                if (!token.starts_with("--")) {
+                    continue;
+                }
+
+                std::string name = token.substr(2);
+                auto        def  = arg_defs_.find(name);
+                if (def == arg_defs_.end()) {
+                    RLOG(LL_ERROR, "Unknown argument: --" + name);
+                    continue;
+                }
+
+                if (i + 1 >= argc_) {
+                    RLOG(LL_ERROR, "Missing value for --" + name);
+                    continue;
+                }
+                std::string raw = argv_[++i];
+
+                // Widest parse for the value's category, then narrow via static_cast —
+                // one path per category instead of ten near-identical ones for every
+                // sized int/float. Silently truncates on overflow rather than
+                // range-checking each width; not worth the complexity for a CLI flag.
+                std::visit(
+                    [&](auto&& placeholder) {
+                        using T = std::decay_t<decltype(placeholder)>;
+
+                        if constexpr (std::same_as<T, std::string>) {
+                            arg_values_[name] = raw;
+                        } else if constexpr (std::floating_point<T>) {
+                            try {
+                                arg_values_[name] = static_cast<T>(std::stod(raw));
+                            } catch (...) {
+                                RLOG(LL_ERROR, "Invalid number for --" + name + ": " + raw);
+                            }
+                        } else if constexpr (std::unsigned_integral<T>) {
+                            try {
+                                arg_values_[name] = static_cast<T>(std::stoull(raw));
+                            } catch (...) {
+                                RLOG(LL_ERROR, "Invalid number for --" + name + ": " + raw);
+                            }
+                        } else {
+                            try {
+                                arg_values_[name] = static_cast<T>(std::stoll(raw));
+                            } catch (...) {
+                                RLOG(LL_ERROR, "Invalid number for --" + name + ": " + raw);
+                            }
+                        }
+                    },
+                    def->second
+                );
+            }
+        }
+
+        template <__IsArgValue T>
+        std::optional<T> arg(const std::string& name) const {
+            auto it = arg_values_.find(name);
+            if (it == arg_values_.end()) {
+                return std::nullopt;
+            }
+
+            if (const T* value = std::get_if<T>(&it->second)) {
+                return *value;
+            }
+            return std::nullopt;
         }
 
         BuildGroup& addGroup() {
