@@ -1209,7 +1209,24 @@ class Task {
     public:
         Task(Output output) : output_(std::move(output)), parent_count_(0) {}
 
+        // Walks parents_ transitively looking for candidate. Used by depends_on() to
+        // reject an edge that would close a cycle, before it's ever added — a task
+        // stuck with parentCount() > 0 forever otherwise just spins Build::build()'s
+        // dispatch loop at 100% CPU with no error and no way out.
+        bool hasAncestor(const Task* candidate) const {
+            for (Task* parent : parents_) {
+                if (parent == candidate || parent->hasAncestor(candidate)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         Task& depends_on(Task& dependency) {
+            if (&dependency == this || dependency.hasAncestor(this)) {
+                RLOG(LL_FATAL, "Dependency cycle: \"" + sourcePath().string() + "\" -> \"" + dependency.sourcePath().string() + "\"");
+            }
+
             dependency.children_.push_back(this);
             parents_.push_back(&dependency);
             ++parent_count_;
