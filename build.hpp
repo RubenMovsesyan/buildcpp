@@ -1361,7 +1361,9 @@ class BuildGroup {
 
             Task&                  new_task = *(new Task(std::move(output)));
             new_task.setGroup(*this);
-            std::filesystem::path key = new_task.sourcePath().stem();
+            // Full path, not stem: two components can each own a same-named file
+            // (e.g. hardware_flash/flash.c and pico_flash/flash.c) without colliding.
+            std::filesystem::path key = new_task.sourcePath();
 
             if (tasks_.contains(key)) {
                 RLOG(LL_FATAL, "Task name collision: \"" + key.string() + "\" is already registered in this group — choose a different name");
