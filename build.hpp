@@ -1837,6 +1837,11 @@ inline bool Task::execute() {
         group_->compiler(), build_dir, group_->includePaths(sym_links), collectObjectFiles(build_dir),
         group_->compileFlags(), group_->linkFlags(), group_->linkables()
     );
+
+    if (result.exit_code != 0 && !result.stderr_output.empty()) {
+        RLOG(LL_ERROR, result.stderr_output);
+    }
+
     return result.exit_code == 0;
 }
 
