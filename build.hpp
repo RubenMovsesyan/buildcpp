@@ -1798,6 +1798,17 @@ class Build {
                         continue;
                     }
 
+                    // A header-stem match is only a real ordering need when it points at
+                    // something that actually generates that header (e.g. a Command task).
+                    // Between two ordinary Objects it's frequently a false positive — peer
+                    // components including each other's public headers (A's .c includes
+                    // B.h, B's .c includes A.h) is normal and creates no real compile-order
+                    // requirement, but would form a cycle here. Skip rather than let
+                    // depends_on()'s cycle check FATAL the whole build over it.
+                    if (other.hasAncestor(task)) {
+                        continue;
+                    }
+
                     task->depends_on(other);
                 }
             }
