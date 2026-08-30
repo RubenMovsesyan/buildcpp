@@ -1128,9 +1128,10 @@ class Output {
             );
         }
 
-        // Doesn't consider header includes yet (see Object::listDependencies) — only
-        // the Object variant's own source file, or the Binary/Library variant's object
-        // files. Missing output, or any input newer than the output, means stale.
+        // Only checks the Object variant's own source file, or the Binary/Library
+        // variant's object files. Header includes are handled separately in
+        // Task::needsRebuild() via Object::listDependencies. Missing output, or any
+        // input newer than the output, means stale.
         bool isStale(const std::filesystem::path& build_dir, const std::vector<std::filesystem::path>& object_files) const {
             std::filesystem::path output_path = outputPath(build_dir);
 
@@ -1863,6 +1864,24 @@ inline bool Task::needsRebuild() {
 
     std::filesystem::path build_dir = group_->buildDir();
     bool                  stale     = output_.isStale(build_dir, collectObjectFiles(build_dir));
+
+    // isStale() only compares the source file itself. For Object tasks, also compare
+    // every header the source pulls in (via `compiler -MM`), so editing an .hpp
+    // rebuilds its includers. Costs one extra compiler spawn per Object per build.
+    if (!stale && isObject()) {
+        std::filesystem::path output_path = outputPath(build_dir);
+        if (std::filesystem::exists(output_path)) {
+            auto output_time = std::filesystem::last_write_time(output_path);
+            for (const std::filesystem::path& dep : listDependencies(build_dir)) {
+                std::error_code ec;
+                auto            dep_time = std::filesystem::last_write_time(dep, ec);
+                if (ec || dep_time > output_time) { // missing/unreadable dep -> rebuild
+                    stale = true;
+                    break;
+                }
+            }
+        }
+    }
 
     if (!stale) {
         for (Task* parent : parents_) {
